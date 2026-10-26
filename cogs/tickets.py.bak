@@ -1,0 +1,1886 @@
+"""
+Cog: Tickets — Sistema de tickets moderno para MineOrbit Network.
+- Panel con Components V2 (Container + Section + botón por categoría)
+- Modal específico por categoría con campos personalizados
+- Modal de motivo de cierre al cerrar
+- Log solo al cerrar (con transcript link, participantes, motivo)
+- DM detallado al creador + valoración por estrellas
+- /history con links de transcript
+
+FIXES aplicados (tanda 1):
+  [FIX 1] BLOQUEANTE — defer() en on_submit() de Modales reemplazado por
+          send_message() + edit_original_response().
+
+  [FIX 2] Views persistentes re-registradas en setup() vía bot.add_view().
+
+  [FIX 3] inactivity_check no reenvía el mismo aviso indefinidamente
+          (en la tanda 1 esto usaba sets en memoria; ver FIX 17 en la
+          tanda 2, donde se migra a columnas persistidas en la DB).
+
+  [FIX 4] Cache en memoria _ticket_channel_cache para evitar un SELECT
+          por cada mensaje del servidor en on_message.
+
+  [FIX 5] Panel migrado a Components V2 (Container + Section + botón).
+
+  [FIX 6] Texto de bienvenida fijo al inicio del panel.
+
+  [FIX 7] DM de cierre migrado a Components V2.
+
+  [FIX 8] Log de cierre migrado a Components V2.
+
+FIXES aplicados (tanda 2 — revisión posterior):
+  [FIX 9]  BLOQUEANTE — TicketControlView.close_btn usaba self.ticket_id,
+           que tras un reinicio del bot es el valor dummy (0) registrado
+           en setup(). Esto hacía que el botón "Cerrar 🔒" respondiera
+           siempre "Ticket no encontrado" en CUALQUIER canal después de
+           un solo reinicio. Corregido para resolver el ticket real vía
+           db.get_ticket_by_channel(interaction.channel_id), igual que
+           ya hacía correctamente claim_btn.
+
+  [FIX 10] BLOQUEANTE — El botón "⭐ Valorar la atención" del DM de cierre
+           tenía el mismo problema de fondo: dependía de self.ticket_id /
+           self.dm_text / self.transcript_url fijados en el constructor de
+           una View registrada con valores dummy en setup(). Tras un
+           reinicio, valorar CUALQUIER ticket cerrado editaba el DM y lo
+           dejaba con el contenido borrado (dm_text="" → "\u200b"), sin
+           registrar la valoración en el canal de log correcto.
+           Solución: migrado a discord.ui.DynamicItem con un custom_id
+           dinámico (f"dm_rate_ticket:{ticket_id}") que discord.py sabe
+           reconstruir sin depender de ninguna instancia de View
+           registrada previamente — soporte nativo de la librería para
+           exactamente este caso. El ticket_id ya no se pierde nunca.
+           Además, el texto del DM y el link de transcript ya no se leen
+           de un atributo en memoria: se reconstruyen en el momento desde
+           (a) los componentes actuales del propio mensaje (dm_text) y
+           (b) el campo transcript_url ya persistido en la DB — así que
+           sobreviven a cualquier cantidad de reinicios sin tocar el
+           esquema de la base de datos.
+
+  [FIX 11] dm_text or "\u200b" → dm_text if dm_text else "\u200b".
+           "" or "\u200b" evalúa a "\u200b" en Python igual que None,
+           así que un dm_text vacío (cadena "") borraba el contenido del
+           DM al re-renderizarlo tras valorar. Ahora es explícito.
+
+  [FIX 12] fmt_name() estaba duplicada (una copia en _close_ticket, otra
+           dentro de _build_dm_transcript_text). Extraída a una única
+           función de módulo _fmt_member_name().
+
+  [FIX 13] claim_btn solo bloqueaba send_messages para el rol fijo
+           checks.STAFF_ROLE_ID al reclamar un ticket, ignorando los
+           roles configurables (staff_role/mod_role/admin_role del
+           guild config) que si tenían acceso de escritura por
+           _open_ticket. Ahora se restringen también esos roles.
+
+  [FIX 14] _notified_inactive / _notified_escalated (sets en memoria)
+           eliminados por completo. Ahora el estado "ya se avisó de esto"
+           vive en dos columnas nuevas de la tabla tickets
+           (notified_inactive / notified_escalated, ver database.py),
+           así que sobrevive a reinicios del bot sin reenviar avisos
+           duplicados. Se resetean al cerrar un ticket vía
+           db.reset_ticket_notifications().
+
+FIXES aplicados (tanda 3 — bug "cierre no borra el canal"):
+  [FIX 15] BLOQUEANTE — _close_ticket marcaba status="closed" en la DB
+           al principio de la función, pero el resto del trabajo
+           (leer mensajes, construir el transcript HTML, enviar DM,
+           enviar log, log_staff_action) no estaba protegido con
+           try/except. Si cualquiera de esos pasos lanzaba una
+           excepción, la función cortaba ahí mismo y NUNCA llegaba al
+           close_embed, al asyncio.sleep(5) ni al channel.delete().
+           Resultado: el ticket quedaba "cerrado" para siempre en la
+           DB (por eso el bot lo detectaba como cerrado) pero el canal
+           de Discord nunca se borraba. Ahora todo ese bloque queda
+           envuelto en un try/except externo (además de sus propios
+           try/except internos más específicos) y el close_embed +
+           sleep + channel.delete() se ejecutan SIEMPRE, sin importar
+           qué haya fallado en el medio. Los errores ya no se tragan en
+           silencio: se imprimen en consola para poder diagnosticarlos.
+
+  [FIX 16] added_staff (columna JSON en la DB) y la generación del
+           transcript HTML no estaban protegidos. Un valor corrupto en
+           added_staff o un error al construir el HTML (por contenido
+           raro en algún mensaje) tumbaban toda la función de cierre
+           por la misma razón del FIX 15. Ahora ambos tienen su propio
+           try/except: si fallan, el cierre continúa sin transcript /
+           sin staff añadido en vez de abortar.
+
+  [FIX 17] El DM de cierre y el log de cierre se enviaban sin
+           allowed_mentions, y el motivo de cierre (close_reason) es
+           texto libre escrito por quien cierra el ticket —incluido el
+           propio usuario, que puede cerrar su ticket— e iba insertado
+           tal cual dentro de un TextDisplay (Components V2, equivale a
+           contenido de mensaje). Esto permitía que un close_reason como
+           "@everyone" o "<@&ID_DE_ROL>" disparara una mención real al
+           enviarse al canal de log o al DM. Ahora ambos envíos usan
+           allowed_mentions=discord.AllowedMentions.none().
+
+  [FIX 18] close_btn (botón "Cerrar 🔒") solo permitía cerrar a los
+           roles fijos checks.STAFF_ROLE_ID / MOD_ROLE_ID, ignorando los
+           roles configurables (staff_role/mod_role/admin_role) que sí
+           respeta claim_btn desde el FIX 13 y que sí reciben acceso de
+           escritura en _open_ticket. Ahora se aplica el mismo patrón
+           que en claim_btn.
+
+  [FIX 19] El botón "📄 Ver Transcript" que se reconstruye tras valorar
+           (y el que se manda en el DM inicial) usaba transcript_url —el
+           jump_url del mensaje en el canal de LOG de staff, al que el
+           creador del ticket normalmente no tiene acceso— en vez del
+           link del archivo adjunto que se le mandó directamente por DM
+           (dm_transcript_url). Esto hacía que el botón le diera un error
+           de permisos al usuario final. Ahora se persiste también
+           dm_transcript_url en la DB (columna dm_transcript_url) y se
+           usa esa URL para el botón que ve el usuario.
+
+  [FIX 20] RatingDMView seguía usando dm_text or "\u200b" en el
+           constructor, el mismo patrón ya corregido en RatingModal por
+           el FIX 11. Igualado por consistencia (dm_text if dm_text
+           else "\u200b").
+
+FIXES aplicados (tanda 4 — revisión de database.py / integración):
+  [FIX 21] BLOQUEANTE — reintroducía el mismo bug del FIX 15 por otra
+           vía: en _close_ticket, la llamada a
+           db.reset_ticket_notifications(ticket_id) estaba ANTES del
+           try/except externo del FIX 15 (justo después de marcar
+           status="closed"). db.reset_ticket_notifications no existía
+           en database.py en ese momento — cualquier AttributeError (o,
+           tras agregarla, cualquier fallo futuro de esa llamada
+           puntual) volvía a cortar la función antes de llegar al
+           close_embed/sleep/channel.delete(), dejando otra vez el
+           ticket "cerrado" en DB con el canal sin borrar. Ahora la
+           llamada vive DENTRO del try/except externo (con logging
+           propio si falla) y ya no puede volver a bloquear el borrado
+           del canal.
+
+  [FIX 22] BLOQUEANTE — /reopen llamaba a db.reset_ticket_notifications
+           sin ningún try/except a su alrededor. Un fallo ahí (columna
+           inexistente, error de conexión, etc.) tumbaba todo el
+           comando antes de restaurar permisos del canal y antes de
+           responder al staff, dejando el ticket en un estado
+           intermedio confuso (reabierto en apariencia pero sin
+           permisos ni respuesta). Envuelto en su propio try/except con
+           log a consola; el resto del reopen continúa igual.
+
+  [FIX 23] db.get_inactive_tickets(hours, notified_column=...) y
+           db.mark_ticket_notified_inactive/escalated no existían en
+           database.py pese a estar documentadas como "ver database.py"
+           desde el FIX 14 — inactivity_check fallaba en cada ciclo de
+           30 min (capturado por su propio try/except de tarea, así
+           que no tumbaba el bot, pero el sistema de avisos de
+           inactividad/escalado estaba completamente inoperativo).
+           Corregido en database.py: get_inactive_tickets ahora acepta
+           notified_column, y se agregaron
+           mark_ticket_notified_inactive/escalated y
+           reset_ticket_notifications. No requiere cambios en
+           tickets.py más allá de los ya existentes.
+
+FIXES aplicados (tanda 5 — reclamo de tickets):
+  [FIX 24] BLOQUEANTE — claim_btn nunca comprobaba si el ticket ya tenía
+           un claimed_by asignado: simplemente pisaba el valor con
+           db.update_ticket(ticket_id, claimed_by=user.id) sin importar
+           si otro staff ya lo había reclamado antes. El botón
+           "Reclamar ✋" además es parte de una View persistente con
+           custom_id fijo y timeout=None, así que nunca se deshabilitaba
+           tras el primer clic — cualquier staff podía seguir
+           presionándolo indefinidamente, re-bloqueando permisos y
+           reasignándose el ticket a sí mismo. Corregido usando
+           db.claim_ticket(), que resuelve la comprobación + el UPDATE
+           en una sola operación atómica (UPDATE ... WHERE claimed_by
+           IS NULL), con el mismo patrón que ya usan end_giveaway() y
+           withdraw() en database.py — así ni siquiera dos clics casi
+           simultáneos pueden pisarse entre sí. Si el ticket ya estaba
+           reclamado, se informa al staff quién lo tiene en vez de
+           reasignarlo en silencio.
+
+           Además se agregó el comando /unclaim para liberar un reclamo:
+           el propio staff que lo reclamó puede liberarlo, o un
+           Admin/Mod puede forzar la liberación (p. ej. si el staff que
+           lo reclamó está desconectado). Usa db.release_ticket(), el
+           helper simétrico a claim_ticket().
+"""
+
+import asyncio
+import io
+import json
+import re
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+from datetime import datetime
+from database import db
+from utils import helpers, checks
+from config import (
+    COLOR_TICKET,
+    COLOR_SUCCESS,
+    COLOR_ERROR,
+    COLOR_WARNING,
+    TICKET_INACTIVITY_HOURS,
+    TICKET_ESCALATE_HOURS,
+)
+
+# ── Etiquetas de categoría ────────────────────────────────────────────────────
+
+CATEGORY_LABELS = {
+    "tienda":         "Tienda",
+    "soporte":        "Soporte",
+    "apelaciones":    "Apelaciones",
+    "reportes":       "Reportes",
+    "reportes_staff": "Reportes Staff",
+    "media":          "Media",
+    "revives":        "Revives",
+}
+
+CATEGORY_EMOJIS: dict[str, str] = {
+    "tienda":         "🛒",
+    "soporte":        "🛰️",
+    "apelaciones":    "⚖️",
+    "reportes":       "🎯",
+    "reportes_staff": "🛡️",
+    "media":          "🎥",
+    "revives":        "❤️",
+}
+
+# FIX 5: descripción corta por categoría, usada en cada Section del panel V2.
+CATEGORY_DESCRIPTIONS: dict[str, str] = {
+    "tienda":         "Recibe ayuda relacionada con compras, pagos o problemas de la tienda.",
+    "soporte":        "Obtén soporte general relacionado con el servidor.",
+    "apelaciones":    "Solicita una revisión de una sanción recibida dentro del servidor.",
+    "reportes":       "Reporta usuarios que estén utilizando hacks o haciendo trampas.",
+    "reportes_staff": "Reporta comportamientos inadecuados por parte de algún miembro del Staff.",
+    "media":          "Abre un ticket para postularte al equipo de Media.",
+    "revives":        "Solicita un revive debido a bugs o acciones de hackers.",
+}
+
+PANEL_INTRO_TEXT = (
+    "## ⚒ Soporte de MineOrbit Network\n"
+    "### ❓ ¿Necesitas ayuda?\n"
+    "En MineOrbit nos esforzamos por brindar una atención rápida, organizada y de calidad "
+    "a todos nuestros jugadores 🚀\n\n"
+    "Nuestro equipo de Staff estará disponible para ayudarte y resolver tu situación de la "
+    "manera más cómoda y profesional posible.\n\n"
+    "Selecciona la categoría correspondiente y automáticamente se creará un ticket privado "
+    "donde podrás recibir atención personalizada."
+)
+
+# ── Cache de canales de ticket ────────────────────────────────────────────────
+# FIX 4: evita un SELECT por cada mensaje en cualquier canal del servidor.
+# Mapea channel_id → ticket_id | None. Se invalida en apertura/cierre.
+_ticket_channel_cache: dict[int, int | None] = {}
+
+# ── Helper compartido de formateo ─────────────────────────────────────────────
+# FIX 12: única definición, usada tanto en _close_ticket como en
+# _build_dm_transcript_text (antes estaba duplicada en ambos sitios).
+def _fmt_member_name(guild: discord.Guild, uid: int) -> str:
+    m = guild.get_member(uid)
+    return str(m) if m else f"Usuario ({uid})"
+
+
+# ── Modales por categoría ─────────────────────────────────────────────────────
+
+class TiendaModal(discord.ui.Modal, title="🛒 Ticket de Tienda"):
+    nick     = discord.ui.TextInput(label="Nick", placeholder="Ej: Steve123", max_length=32)
+    bedrock  = discord.ui.TextInput(label="¿Eres de Bedrock?", placeholder="Sí / No", max_length=5)
+    modalidad = discord.ui.TextInput(label="Modalidad", placeholder="Ej: Survival, Skyblock, Anarchy…", max_length=60)
+    tebex_id = discord.ui.TextInput(label="Tebex ID", placeholder="ID de tu compra en Tebex", max_length=60)
+    problema = discord.ui.TextInput(
+        label="Describe tu problema",
+        placeholder="Cuéntanos qué ocurrió con tu compra…",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # FIX 1: send_message() es la única respuesta válida para un modal submit.
+        await interaction.response.send_message("⏳ Creando tu ticket…", ephemeral=True)
+        await _open_ticket(interaction, "tienda", [
+            ("Nick", self.nick.value),
+            ("¿Eres de Bedrock?", self.bedrock.value),
+            ("Modalidad", self.modalidad.value),
+            ("Tebex ID", self.tebex_id.value),
+            ("Describe tu problema", self.problema.value),
+        ])
+
+
+class SoporteModal(discord.ui.Modal, title="🛰️ Ticket de Soporte"):
+    nick      = discord.ui.TextInput(label="Nick", placeholder="Ej: Steve123", max_length=32)
+    bedrock   = discord.ui.TextInput(label="¿Eres de Bedrock?", placeholder="Sí / No", max_length=5)
+    modalidad = discord.ui.TextInput(label="Modalidad", placeholder="Ej: Survival, Skyblock, Anarchy…", max_length=60)
+    problema  = discord.ui.TextInput(
+        label="Describe tu problema",
+        placeholder="Cuéntanos en qué podemos ayudarte…",
+        style=discord.TextStyle.paragraph,
+        max_length=600,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message("⏳ Creando tu ticket…", ephemeral=True)
+        await _open_ticket(interaction, "soporte", [
+            ("Nick", self.nick.value),
+            ("¿Eres de Bedrock?", self.bedrock.value),
+            ("Modalidad", self.modalidad.value),
+            ("¿Cómo podemos ayudarte?", self.problema.value),
+        ])
+
+
+class ApelacionModal(discord.ui.Modal, title="⚖️ Apelación de Sanción"):
+    nick       = discord.ui.TextInput(label="Tu Nick", placeholder="Ej: Steve123", max_length=32)
+    nick_staff = discord.ui.TextInput(label="Nick del Staff que te sancionó", placeholder="Ej: ModAlex", max_length=32)
+    modalidad  = discord.ui.TextInput(label="Modalidad", placeholder="Ej: Survival, Skyblock, Anarchy…", max_length=60)
+    motivo     = discord.ui.TextInput(
+        label="Motivo de la sanción",
+        placeholder="Explica por qué crees que la sanción fue injusta o debería revisarse…",
+        style=discord.TextStyle.paragraph,
+        max_length=600,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message("⏳ Creando tu ticket…", ephemeral=True)
+        await _open_ticket(interaction, "apelaciones", [
+            ("Nick", self.nick.value),
+            ("Nick del Staff que te sancionó", self.nick_staff.value),
+            ("Modalidad", self.modalidad.value),
+            ("Motivo de la sanción", self.motivo.value),
+        ])
+
+
+class ReportesModal(discord.ui.Modal, title="🎯 Reporte de Usuario"):
+    nick           = discord.ui.TextInput(label="Tu Nick", placeholder="Ej: Steve123", max_length=32)
+    modalidad      = discord.ui.TextInput(label="Modalidad", placeholder="Ej: Survival, Skyblock, Anarchy…", max_length=60)
+    nick_reportado = discord.ui.TextInput(label="Nick del usuario reportado", placeholder="Ej: Hacker456", max_length=32)
+    motivo         = discord.ui.TextInput(
+        label="Motivo del reporte",
+        placeholder="Describe qué hizo el usuario y si tienes pruebas (capturas, video)…",
+        style=discord.TextStyle.paragraph,
+        max_length=600,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message("⏳ Creando tu ticket…", ephemeral=True)
+        await _open_ticket(interaction, "reportes", [
+            ("Nick", self.nick.value),
+            ("Modalidad", self.modalidad.value),
+            ("Nick del usuario reportado", self.nick_reportado.value),
+            ("Motivo del reporte", self.motivo.value),
+        ])
+
+
+class ReportesStaffModal(discord.ui.Modal, title="🛡️ Reporte de Staff"):
+    nick       = discord.ui.TextInput(label="Tu Nick", placeholder="Ej: Steve123", max_length=32)
+    nick_staff = discord.ui.TextInput(label="Nick del Staff", placeholder="Ej: ModAlex", max_length=32)
+    modalidad  = discord.ui.TextInput(label="Modalidad", placeholder="Ej: Survival, Skyblock, Anarchy…", max_length=60)
+    motivo     = discord.ui.TextInput(
+        label="Motivo del reporte",
+        placeholder="Describe el comportamiento inadecuado del Staff…",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+    )
+    pruebas    = discord.ui.TextInput(label="¿Tienes pruebas?", placeholder="Sí / No", max_length=5)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message("⏳ Creando tu ticket…", ephemeral=True)
+        await _open_ticket(interaction, "reportes_staff", [
+            ("Nick", self.nick.value),
+            ("Nick del Staff", self.nick_staff.value),
+            ("Modalidad", self.modalidad.value),
+            ("Motivo del reporte", self.motivo.value),
+            ("¿Tienes pruebas?", self.pruebas.value),
+        ])
+
+
+class MediaModal(discord.ui.Modal, title="🎥 Postulación Media"):
+    nick       = discord.ui.TextInput(label="Tu Nick", placeholder="Ej: Steve123", max_length=32)
+    modalidad  = discord.ui.TextInput(label="Modalidad", placeholder="Ej: Survival, Skyblock, Anarchy…", max_length=60)
+    red_social = discord.ui.TextInput(label="Red Social / Canal", placeholder="Ej: youtube.com/tucanal", max_length=100)
+    requisitos = discord.ui.TextInput(label="¿Cumples los requisitos?", placeholder="Sí / No", max_length=5)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message("⏳ Creando tu ticket…", ephemeral=True)
+        await _open_ticket(interaction, "media", [
+            ("Nick", self.nick.value),
+            ("Modalidad", self.modalidad.value),
+            ("Red Social / Canal", self.red_social.value),
+            ("¿Cumples los requisitos?", self.requisitos.value),
+        ])
+
+
+class RevivesModal(discord.ui.Modal, title="❤️ Solicitud de Revive"):
+    nick       = discord.ui.TextInput(label="Tu Nick", placeholder="Ej: Steve123", max_length=32)
+    modalidad  = discord.ui.TextInput(label="Modalidad", placeholder="Ej: Survival, Skyblock, Anarchy…", max_length=60)
+    nick_killer = discord.ui.TextInput(label="Nick del usuario que te mató", placeholder="Ej: Hacker456", max_length=32)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message("⏳ Creando tu ticket…", ephemeral=True)
+        await _open_ticket(interaction, "revives", [
+            ("Nick", self.nick.value),
+            ("Modalidad", self.modalidad.value),
+            ("Nick del usuario que te mató", self.nick_killer.value),
+        ])
+
+
+# ── Modal de cierre ───────────────────────────────────────────────────────────
+
+class CloseReasonModal(discord.ui.Modal, title="🔒 Cerrar Ticket"):
+    reason = discord.ui.TextInput(
+        label="Motivo del cierre",
+        max_length=200,
+        placeholder="Ej: Problema resuelto, Sin respuesta del usuario…",
+    )
+
+    def __init__(self, ticket_id: int):
+        super().__init__()
+        self.ticket_id = ticket_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # FIX 1: send_message() primero, luego operar. El cierre puede tardar
+        # (sleep de 5s + delete del canal) así que necesitamos acknowledged.
+        await interaction.response.send_message("⏳ Cerrando ticket…", ephemeral=True)
+        await _close_ticket(interaction, self.ticket_id, self.reason.value.strip())
+
+
+# ── Sistema de valoración ─────────────────────────────────────────────────────
+
+class RatingModal(discord.ui.Modal, title="Valorar la atención"):
+    rating  = discord.ui.TextInput(label="Puntuación (1-5 estrellas)", placeholder="Ej: 5", max_length=1)
+    comment = discord.ui.TextInput(
+        label="Comentario (opcional)",
+        placeholder="Cuéntanos cómo fue tu experiencia (opcional)…",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=300,
+    )
+
+    def __init__(self, ticket_id: int, log_channel_id: int | None, dm_text: str = "",
+                 original_message: discord.Message | None = None,
+                 transcript_url: str | None = None):
+        super().__init__()
+        self.ticket_id        = ticket_id
+        self.log_channel_id   = log_channel_id
+        self.dm_text          = dm_text
+        self.original_message = original_message
+        self.transcript_url   = transcript_url
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            r = int(self.rating.value)
+            if not 1 <= r <= 5:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Puntuación inválida. Escribe un número del 1 al 5.", ephemeral=True
+            )
+        await db.update_ticket(
+            self.ticket_id, rating=r, rating_comment=self.comment.value or None
+        )
+        stars = "⭐" * r
+        await interaction.response.send_message(
+            f"✅ ¡Gracias por tu valoración! {stars}", ephemeral=True
+        )
+        if self.original_message:
+            # FIX 7: el mensaje original es Components V2 (LayoutView), así que
+            # al editarlo hay que reconstruir el mismo Container de texto y
+            # solo cambiar el botón de "Valorar" por el link de transcript
+            # (o quitar el ActionRow por completo si no hay transcript).
+            new_view = discord.ui.LayoutView()
+            container = discord.ui.Container(accent_color=COLOR_TICKET)
+            # FIX 11: "" or "\u200b" también da "\u200b" en Python, así que
+            # hay que comprobar explícitamente en vez de usar `or`.
+            container.add_item(
+                discord.ui.TextDisplay(self.dm_text if self.dm_text else "\u200b")
+            )
+            new_view.add_item(container)
+            if self.transcript_url:
+                row = discord.ui.ActionRow()
+                row.add_item(discord.ui.Button(
+                    label="📄 Ver Transcript",
+                    url=self.transcript_url,
+                    style=discord.ButtonStyle.link,
+                ))
+                new_view.add_item(row)
+            try:
+                await self.original_message.edit(view=new_view)
+            except Exception:
+                pass
+        if self.log_channel_id:
+            log_ch = interaction.client.get_channel(self.log_channel_id)
+            if log_ch:
+                embed = discord.Embed(
+                    title=f"⭐ Valoración — Ticket #{self.ticket_id}",
+                    color=COLOR_SUCCESS,
+                )
+                embed.add_field(name="Puntuación", value=f"{stars} ({r}/5)", inline=True)
+                embed.add_field(name="Usuario", value=str(interaction.user), inline=True)
+                if self.comment.value:
+                    embed.add_field(name="Comentario", value=self.comment.value, inline=False)
+                embed.set_thumbnail(url=interaction.user.display_avatar.url)
+                try:
+                    await log_ch.send(embed=embed)
+                except Exception:
+                    pass
+
+
+def _extract_dm_text_from_message(message: discord.Message) -> str:
+    """FIX 10: reconstruye el texto actual del Container del DM leyendo los
+    componentes ya renderizados del propio mensaje, en vez de depender de un
+    atributo dm_text guardado en memoria en la View (que se pierde tras un
+    reinicio del bot). discord.ui.LayoutView.from_message() es el método
+    soportado por discord.py para convertir los componentes V2 de un mensaje
+    ya existente en items utilizables."""
+    try:
+        layout = discord.ui.LayoutView.from_message(message)
+    except Exception:
+        return ""
+    for item in layout.walk_children():
+        if isinstance(item, discord.ui.TextDisplay):
+            return item.content
+    return ""
+
+
+class RatingButtonDynamic(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"dm_rate_ticket:(?P<ticket_id>[0-9]+)",
+):
+    """FIX 10 — Botón '⭐ Valorar la atención' del DM de cierre.
+
+    Antes este botón vivía en una View "normal" (RatingButton dentro de
+    RatingDMView) registrada en setup() con un ticket_id dummy (0). Tras un
+    reinicio del bot, CUALQUIER valoración pulsada usaba ese dummy: perdía
+    el ticket real, el log_channel_id, y borraba el texto del DM al
+    reeditarlo.
+
+    discord.ui.DynamicItem existe justo para este caso: el ticket_id viaja
+    codificado en el propio custom_id ("dm_rate_ticket:123"), y discord.py
+    reconstruye la instancia correcta en cada interacción sin depender de
+    ninguna View registrada previamente en memoria. Solo hace falta
+    registrar la CLASE una vez con bot.add_dynamic_items() en setup().
+    """
+
+    def __init__(self, ticket_id: int):
+        super().__init__(
+            discord.ui.Button(
+                label="⭐ Valorar la atención",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"dm_rate_ticket:{ticket_id}",
+            )
+        )
+        self.ticket_id = ticket_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match: re.Match, /):
+        return cls(int(match["ticket_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        ticket = await db.get_ticket(self.ticket_id)
+
+        log_channel_id = None
+        transcript_url = None
+        if ticket:
+            config = await db.get_guild_config(ticket["guild_id"])
+            log_channel_id = config.get("ticket_log_channel")
+            # FIX 19: antes acá se usaba ticket.get("transcript_url") —el
+            # jump_url del mensaje en el canal de LOG de staff, al que el
+            # creador del ticket normalmente NO tiene acceso—, así que el
+            # botón "Ver Transcript" que ve el usuario le daba un error de
+            # permisos. Ahora se prioriza dm_transcript_url (el link del
+            # adjunto que se le mandó directamente por DM), y solo se cae a
+            # transcript_url si por algún motivo el primero no existe.
+            transcript_url = ticket.get("dm_transcript_url") or ticket.get("transcript_url")
+
+        # El texto del DM se lee en vivo del propio mensaje en vez de un
+        # atributo en memoria — sobrevive a cualquier reinicio sin tocar
+        # el esquema de la base de datos.
+        dm_text = _extract_dm_text_from_message(interaction.message)
+
+        await interaction.response.send_modal(
+            RatingModal(
+                self.ticket_id, log_channel_id, dm_text,
+                interaction.message, transcript_url,
+            )
+        )
+
+
+class RatingDMView(discord.ui.LayoutView):
+    """DM de cierre con Components V2: el texto de la transcripción va en un
+    Container, y el botón de valorar (dinámico, ver RatingButtonDynamic) en
+    un ActionRow debajo."""
+
+    def __init__(self, ticket_id: int, log_channel_id: int | None,
+                 dm_text: str = "", transcript_url: str | None = None):
+        super().__init__()
+        container = discord.ui.Container(accent_color=COLOR_TICKET)
+        # FIX 20: mismo problema que el FIX 11 pero acá — "" or "\u200b" da
+        # "\u200b" igual que None, hay que comprobar explícitamente.
+        container.add_item(discord.ui.TextDisplay(dm_text if dm_text else "\u200b"))
+        self.add_item(container)
+
+        row = discord.ui.ActionRow()
+        row.add_item(RatingButtonDynamic(ticket_id))
+        self.add_item(row)
+
+
+# ── Vista de control del ticket ───────────────────────────────────────────────
+
+class TicketControlView(discord.ui.View):
+    def __init__(self, ticket_id: int):
+        super().__init__(timeout=None)
+        self.ticket_id = ticket_id
+
+    @discord.ui.button(
+        label="Cerrar 🔒",
+        style=discord.ButtonStyle.danger,
+        custom_id="ticket_close_btn",
+        row=0,
+    )
+    async def close_btn(self, interaction: discord.Interaction, _):
+        # FIX 9: resolver el ticket real por canal en vez de self.ticket_id.
+        # self.ticket_id solo es correcto en la instancia que se envió en
+        # esta misma sesión; tras un reinicio, la View registrada en
+        # setup() usa un ticket_id dummy (0) y este botón fallaba SIEMPRE
+        # con "Ticket no encontrado" en cualquier canal. claim_btn ya
+        # resolvía correctamente por canal — aplicamos el mismo patrón aquí.
+        ticket = await db.get_ticket_by_channel(interaction.channel_id)
+        if not ticket:
+            return await interaction.response.send_message(
+                "Ticket no encontrado.", ephemeral=True
+            )
+        can_close = (
+            interaction.user.guild_permissions.administrator
+            or interaction.user.guild_permissions.manage_channels
+            or interaction.user.id == ticket["user_id"]
+            or any(r.id == checks.STAFF_ROLE_ID for r in interaction.user.roles)
+            or any(r.id == checks.MOD_ROLE_ID for r in interaction.user.roles)
+        )
+        # FIX 18: además de los roles fijos, también hay que respetar los
+        # roles configurables (staff_role/mod_role/admin_role) del guild
+        # config — igual que ya hace claim_btn desde el FIX 13, y como
+        # ya reciben acceso de escritura en _open_ticket. Antes, un
+        # servidor que configuraba solo roles custom (sin usar los IDs
+        # fijos de checks.py) no podía cerrar tickets con este botón.
+        if not can_close:
+            config = await db.get_guild_config(interaction.guild_id)
+            for role_key in ("staff_role", "mod_role", "admin_role"):
+                rid = config.get(role_key)
+                if rid and any(r.id == rid for r in interaction.user.roles):
+                    can_close = True
+                    break
+        if not can_close:
+            return await interaction.response.send_message(
+                "❌ No tienes permiso para cerrar este ticket.", ephemeral=True
+            )
+        await interaction.response.send_modal(CloseReasonModal(ticket["id"]))
+
+    @discord.ui.button(
+        label="Reclamar ✋",
+        style=discord.ButtonStyle.primary,
+        custom_id="ticket_claim_btn",
+        row=0,
+    )
+    async def claim_btn(self, interaction: discord.Interaction, _):
+        user = interaction.user
+        is_staff = (
+            user.guild_permissions.administrator
+            or user.guild_permissions.manage_channels
+            or any(r.id == checks.STAFF_ROLE_ID for r in user.roles)
+            or any(r.id == checks.MOD_ROLE_ID for r in user.roles)
+        )
+        config = await db.get_guild_config(interaction.guild_id)
+        if not is_staff:
+            for role_key in ("staff_role", "mod_role", "admin_role"):
+                rid = config.get(role_key)
+                if rid and any(r.id == rid for r in user.roles):
+                    is_staff = True
+                    break
+        if not is_staff:
+            return await interaction.response.send_message(
+                "❌ Solo el staff puede reclamar tickets.", ephemeral=True
+            )
+        ticket = await db.get_ticket_by_channel(interaction.channel_id)
+        if not ticket:
+            return await interaction.response.send_message(
+                "❌ No se encontró el ticket.", ephemeral=True
+            )
+
+        # [FIX 24] BLOQUEANTE — antes se pisaba claimed_by sin comprobar si
+        # ya tenía dueño: cualquier staff que presionara "Reclamar" después
+        # del primer clic reescribía claimed_by con su propio id, volvía a
+        # correr el bloqueo de permisos y mandaba otro embed de "reclamado",
+        # dando la falsa impresión de que el segundo reclamo era válido.
+        # db.claim_ticket() hace la comprobación + el UPDATE en una sola
+        # operación atómica (WHERE claimed_by IS NULL), así que ni siquiera
+        # dos clics casi simultáneos pueden pisarse entre sí.
+        claimed = await db.claim_ticket(ticket["id"], user.id)
+        if not claimed:
+            fresh = await db.get_ticket(ticket["id"])
+            claimed_by_id = fresh.get("claimed_by") if fresh else None
+            if claimed_by_id == user.id:
+                return await interaction.response.send_message(
+                    "❌ Ya reclamaste este ticket.", ephemeral=True
+                )
+            claimer = interaction.guild.get_member(claimed_by_id) if claimed_by_id else None
+            claimer_text = claimer.mention if claimer else (
+                f"<@{claimed_by_id}>" if claimed_by_id else "otro miembro del staff"
+            )
+            return await interaction.response.send_message(
+                f"❌ Este ticket ya fue reclamado por {claimer_text}. "
+                "Usa `/unclaim` si necesitas liberarlo.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer()
+        await db.log_staff_action(
+            interaction.guild_id, user.id, "ticket_claim", ticket["id"]
+        )
+        opener = interaction.guild.get_member(ticket["user_id"])
+
+        # FIX 13: además del rol fijo checks.STAFF_ROLE_ID, también hay que
+        # silenciar los roles configurables (staff_role/mod_role/admin_role)
+        # que _open_ticket les da acceso de escritura — si no, el resto del
+        # staff con esos roles configurables seguiría pudiendo escribir en
+        # un ticket ya reclamado, contradiciendo el propósito del botón.
+        roles_to_restrict: list[discord.Role] = []
+        staff_role_obj = interaction.guild.get_role(checks.STAFF_ROLE_ID)
+        if staff_role_obj:
+            roles_to_restrict.append(staff_role_obj)
+        for role_key in ("staff_role", "mod_role", "admin_role"):
+            rid = config.get(role_key)
+            if rid:
+                role = interaction.guild.get_role(rid)
+                if role and role not in roles_to_restrict:
+                    roles_to_restrict.append(role)
+
+        for role in roles_to_restrict:
+            try:
+                await interaction.channel.set_permissions(
+                    role,
+                    view_channel=True,
+                    send_messages=False,
+                    read_message_history=True,
+                )
+            except Exception:
+                pass
+
+        await interaction.channel.set_permissions(
+            user, view_channel=True, send_messages=True, read_message_history=True
+        )
+        if opener:
+            await interaction.channel.set_permissions(
+                opener, view_channel=True, send_messages=True, read_message_history=True
+            )
+        embed = discord.Embed(
+            description=f"✋ El staff {user.mention} ha reclamado este ticket.",
+            color=COLOR_SUCCESS,
+        )
+        await interaction.followup.send(embed=embed)
+
+
+# ── Panel (FIX 5: Components V2) ──────────────────────────────────────────────
+
+_CATEGORY_MODAL_MAP: dict[str, type] = {
+    "tienda":         TiendaModal,
+    "soporte":        SoporteModal,
+    "apelaciones":    ApelacionModal,
+    "reportes":       ReportesModal,
+    "reportes_staff": ReportesStaffModal,
+    "media":          MediaModal,
+    "revives":        RevivesModal,
+}
+
+
+class TicketOpenButton(discord.ui.Button):
+    """Botón 'Abrir Ticket' que dispara directamente el modal de su categoría."""
+
+    def __init__(self, category: str):
+        super().__init__(
+            label="Abrir Ticket",
+            style=discord.ButtonStyle.primary,
+            # custom_id estable por categoría — necesario para que bot.add_view()
+            # pueda re-mapear el botón a su callback tras un reinicio (ver FIX 2).
+            custom_id=f"ticket_open_{category}",
+        )
+        self.category = category
+
+    async def callback(self, interaction: discord.Interaction):
+        modal_cls = _CATEGORY_MODAL_MAP.get(self.category)
+        if modal_cls:
+            await interaction.response.send_modal(modal_cls())
+        else:
+            await interaction.response.send_message(
+                "❌ Categoría no reconocida. Avisa a un administrador.", ephemeral=True
+            )
+
+
+class TicketCategorySection(discord.ui.Section):
+    """Una fila del panel: emoji + título + descripción a la izquierda,
+    botón 'Abrir Ticket' como accessory a la derecha."""
+
+    def __init__(self, category: str):
+        emoji = CATEGORY_EMOJIS.get(category, "🎫")
+        title = CATEGORY_LABELS.get(category, category)
+        description = CATEGORY_DESCRIPTIONS.get(category, "")
+        super().__init__(
+            discord.ui.TextDisplay(f"### {emoji} {title}\n{description}"),
+            accessory=TicketOpenButton(category),
+        )
+
+
+class TicketPanelContainer(discord.ui.Container):
+    """Agrupa todas las secciones de categoría dentro de un único bloque
+    con borde de color (accent_color), separadas por líneas divisorias.
+
+    Nota: Section SÍ es un hijo válido de Container en Components V2
+    (discord.py >= 2.6) — no hace falta moverlo a nivel de LayoutView."""
+
+    def __init__(self):
+        super().__init__(accent_color=COLOR_TICKET)
+
+        # FIX 6: texto de bienvenida — información fija, no es una categoría
+        # de ticket, va siempre antes del listado de categorías.
+        self.add_item(discord.ui.TextDisplay(PANEL_INTRO_TEXT))
+        self.add_item(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large))
+
+        categories = list(CATEGORY_LABELS.keys())
+        for i, category in enumerate(categories):
+            self.add_item(TicketCategorySection(category))
+            if i < len(categories) - 1:
+                self.add_item(
+                    discord.ui.Separator(
+                        visible=True, spacing=discord.SeparatorSpacing.small
+                    )
+                )
+        self.add_item(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+        self.add_item(discord.ui.TextDisplay(
+            "-# MineOrbit Network — El mal uso del sistema de tickets podrá resultar en sanciones."
+        ))
+
+
+class TicketPanelView(discord.ui.LayoutView):
+    """View persistente del panel (Components V2). timeout=None para que no expire."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(TicketPanelContainer())
+
+
+# ── Helpers de apertura y cierre ──────────────────────────────────────────────
+
+async def _open_ticket(
+    interaction: discord.Interaction,
+    category: str,
+    fields: list[tuple[str, str]],
+):
+    guild = interaction.guild
+    config = await db.get_guild_config(guild.id)
+
+    # FIX 1: ya no usamos followup.send() sino edit_original_response()
+    # porque la interacción fue acknowledged con send_message() en on_submit().
+    async def reply(content: str):
+        try:
+            await interaction.edit_original_response(content=content)
+        except Exception:
+            pass
+
+    # Un ticket por usuario
+    open_tickets = await db.get_open_tickets(guild.id)
+    user_open = [t for t in open_tickets if t["user_id"] == interaction.user.id]
+    if user_open:
+        ch = guild.get_channel(user_open[0]["channel_id"])
+        if ch:
+            return await reply(f"❌ Ya tienes un ticket abierto: {ch.mention}")
+        # Canal ya no existe pero el ticket sigue abierto en DB — lo cerramos
+        await db.update_ticket(user_open[0]["id"], status="closed")
+
+    category_id = config.get("ticket_category")
+    discord_cat = guild.get_channel(category_id) if category_id else None
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, manage_channels=True
+        ),
+    }
+    staff_role = guild.get_role(checks.STAFF_ROLE_ID)
+    if staff_role:
+        overwrites[staff_role] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True
+        )
+    for role_key in ("staff_role", "mod_role", "admin_role"):
+        rid = config.get(role_key)
+        if rid:
+            role = guild.get_role(rid)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True
+                )
+
+    try:
+        channel = await guild.create_text_channel(
+            name="ticket-nuevo",
+            category=discord_cat,
+            overwrites=overwrites,
+            topic=f"Ticket de {interaction.user} | {CATEGORY_LABELS.get(category, category)}",
+        )
+    except discord.Forbidden:
+        return await reply("❌ No tengo permisos para crear canales. Avisa a un administrador.")
+    except Exception as e:
+        return await reply(f"❌ Error al crear el canal: {e}")
+
+    description = "\n".join(f"{k}: {v}" for k, v in fields)
+    ticket_id = await db.create_ticket(
+        guild_id=guild.id,
+        channel_id=channel.id,
+        user_id=interaction.user.id,
+        category=category,
+        description=description,
+    )
+    await channel.edit(name=f"ticket-{ticket_id}")
+
+    # FIX 4: registrar en cache para evitar SELECT en on_message
+    _ticket_channel_cache[channel.id] = ticket_id
+
+    cat_emoji = CATEGORY_EMOJIS.get(category, "🎫")
+    cat_label = CATEGORY_LABELS.get(category, category)
+    staff_mention = staff_role.mention if staff_role else "el Staff"
+
+    welcome_text = (
+        f"Buenas, {interaction.user.mention}. Este es tu Ticket, "
+        f"el {staff_mention} estará contigo en breves."
+    )
+    embed = discord.Embed(
+        title=f"{cat_emoji} {cat_label}",
+        description=(
+            f"¡Gracias por contactar con el soporte de **{guild.name}**!\n"
+            "Nuestro personal estará contigo en breves."
+        ),
+        color=COLOR_TICKET,
+    )
+    questions_value = "\n".join(f"**{label}**\n{value}" for label, value in fields)
+    embed.add_field(
+        name="__❓ Preguntas:__",
+        value=helpers.truncate(questions_value, 900),
+        inline=False,
+    )
+    embed.add_field(name="👮 Staff Atendiendo:", value=staff_mention, inline=False)
+
+    control_view = TicketControlView(ticket_id)
+    await channel.send(content=welcome_text, embed=embed, view=control_view)
+    await reply(f"✅ Ticket creado: {channel.mention}")
+
+
+# FIX 7: template del DM de cierre, migrado a Components V2 (TextDisplay con
+# markdown de encabezados y citas). Los shortcodes de emoji (:emoji:) los
+# renderiza Discord automáticamente aunque vengan de un bot.
+def _build_dm_transcript_text(
+    ticket: dict,
+    interaction: discord.Interaction,
+    close_reason: str,
+    atendido: str,
+    total_msgs: int,
+    all_staff_ids: list,
+    msg_counts: dict,
+    guild: discord.Guild,
+    transcript_link: str | None,
+) -> str:
+    category_display = CATEGORY_LABELS.get(ticket["category"], ticket["category"]).upper()
+
+    # FIX 12: se usa el helper de módulo _fmt_member_name en vez de una
+    # copia local — antes esta función estaba duplicada aquí y en
+    # _close_ticket.
+
+    # Participantes: staff primero, creador al final; sin duplicados.
+    participant_ids: list = []
+    seen: set = set()
+    for uid in list(all_staff_ids) + [ticket["user_id"]]:
+        if uid not in seen:
+            seen.add(uid)
+            participant_ids.append(uid)
+
+    participant_lines = []
+    for i, uid in enumerate(participant_ids):
+        count = msg_counts.get(uid, 0)
+        prefix = "> " if i == 0 else "> > "
+        participant_lines.append(f"{prefix}👤 **{_fmt_member_name(guild, uid)}:** {count} mensajes")
+    participants_block = "\n".join(participant_lines) or "> 👤 Sin participantes registrados"
+
+    transcript_line = (
+        f"> 🌀 Haz clic **[aquí]({transcript_link})** para visualizar la transcripción completa del ticket."
+        if transcript_link
+        else "> 🌀 La transcripción no pudo generarse para este ticket."
+    )
+
+    return (
+        "# 📄┃TRANSCRIPCIÓN DEL TICKET\n"
+        "Gracias por contactar con el equipo de **MineOrbit**. Esperamos haber resuelto tu consulta "
+        "de la mejor manera posible. 💙\n"
+        "> ⭐ **Tu opinión es importante para nosotros.**\n"
+        "Si aún no lo has hecho, dedica un momento para valorar la atención recibida con una "
+        "puntuación de **1 a 5 estrellas**.\n"
+        "# 📋┃DETALLES DEL TICKET\n"
+        f"> 👤 **Creador:** <@{ticket['user_id']}>\n"
+        f"> > ✏️ **Nombre:** {interaction.channel.name}\n"
+        f"> > 📂 **Categoría:** {category_display}\n"
+        f"> > 🔒 **Cerrado por:** {interaction.user.mention}\n"
+        f"> > 👮 **Atendido por:** {atendido}\n"
+        f"> > 📌 **Motivo del cierre:** {close_reason}\n"
+        f"> > 💬 **Mensajes totales:** {total_msgs} mensajes\n"
+        "# 👥┃PARTICIPANTES\n"
+        f"{participants_block}\n"
+        "# 🔖┃TRANSCRIPCIÓN\n"
+        f"{transcript_line}\n"
+        "✨ Gracias por confiar en el soporte de **MineOrbit**. ¡Esperamos verte nuevamente dentro del servidor!"
+    )
+
+
+# Template del log de cierre (canal de staff). El link "haz clic aquí" solo
+# se ve clickeable de verdad si va dentro de un TextDisplay/Container de
+# Components V2 — en contenido de mensaje plano ese markdown no funciona.
+def _build_close_log_text(
+    ticket_id: int,
+    ticket: dict,
+    claimed_by_id: int | None,
+    participants_text: str,
+    transcript_url: str | None,
+    close_reason: str,
+    interaction: discord.Interaction,
+) -> str:
+    ticket_type = CATEGORY_LABELS.get(ticket["category"], ticket["category"])
+    claimed_by_line = f"<@{claimed_by_id}>" if claimed_by_id else "Sin staff asignado"
+    transcript_line = (
+        f"🔗 [Haz clic aquí para ver el transcript completo.]({transcript_url})"
+        if transcript_url
+        else "🔗 La transcripción no pudo generarse para este ticket."
+    )
+    timestamp = datetime.utcnow().strftime("%d/%m/%Y %H:%M")
+
+    return (
+        "# 🔒┃TICKET CERRADO\n"
+        f"🎫 **Ticket:** #{ticket_id} — {ticket_type}\n"
+        "# 👥┃PARTICIPANTES\n"
+        f"👮 **Staff asignado:** {claimed_by_line}\n"
+        f"{participants_text}\n"
+        "# 📄┃TRANSCRIPCIÓN\n"
+        f"{transcript_line}\n"
+        "# 📌┃MOTIVO DEL CIERRE\n"
+        f"{close_reason}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔒 **Cerrado por:** {interaction.user.mention}    🕒 **Fecha:** {timestamp} UTC"
+    )
+
+
+async def _close_ticket(
+    interaction: discord.Interaction,
+    ticket_id: int,
+    close_reason: str = "Sin motivo especificado",
+):
+    # FIX 1: _close_ticket ya no necesita gestionar la respuesta inicial;
+    # CloseReasonModal.on_submit() ya hizo send_message("⏳ Cerrando…").
+    # Usamos edit_original_response para actualizar ese mensaje efímero.
+    async def reply(content: str = None, embed: discord.Embed = None):
+        try:
+            await interaction.edit_original_response(content=content, embed=embed)
+        except Exception:
+            pass
+
+    ticket = await db.get_ticket(ticket_id)
+    if not ticket:
+        return await reply("❌ Ticket no encontrado.")
+    if ticket["status"] == "closed":
+        return await reply("❌ El ticket ya está cerrado.")
+
+    await db.update_ticket(
+        ticket_id,
+        status="closed",
+        closed_at=datetime.utcnow().isoformat(),
+        close_reason=close_reason,
+    )
+
+    # FIX 4: invalidar cache del canal
+    _ticket_channel_cache.pop(ticket.get("channel_id"), None)
+
+    guild = interaction.guild
+
+    # FIX 15 — BLOQUEANTE: todo el trabajo "de negocio" (leer mensajes,
+    # construir el transcript, mandar DM, mandar log, log_staff_action,
+    # y — desde el FIX 21 — también el reset de notificaciones) va
+    # envuelto en un try/except externo. Antes, cualquier excepción acá
+    # cortaba la función ANTES de llegar al close_embed y al
+    # channel.delete(), dejando el ticket "cerrado" en la DB para siempre
+    # pero el canal nunca se borraba. Ahora, pase lo que pase en el medio,
+    # el flujo SIEMPRE continúa hasta el borrado del canal, y los errores
+    # se imprimen en consola en vez de tragarse en silencio.
+    try:
+        # FIX 21: reset_ticket_notifications se movió DENTRO de este
+        # try/except. Antes vivía justo después del update_ticket() de
+        # arriba, fuera de cualquier protección — si la llamada fallaba
+        # (por ejemplo, por no existir todavía en database.py, o por
+        # cualquier error de DB futuro), cortaba la función antes de
+        # llegar al close_embed/sleep/channel.delete(), reintroduciendo
+        # exactamente el bug que el FIX 15 buscaba resolver. Tiene su
+        # propio try/except interno además del externo, para que un
+        # fallo puntual acá tampoco salte otros pasos posteriores.
+        try:
+            await db.reset_ticket_notifications(ticket_id)
+        except Exception as e:
+            print(f"[TicketsCog] error reseteando notificaciones del ticket {ticket_id}: {e}")
+
+        config = await db.get_guild_config(guild.id)
+        log_ch_id = config.get("ticket_log_channel")
+
+        opener = guild.get_member(ticket["user_id"])
+        if opener:
+            try:
+                await interaction.channel.set_permissions(opener, view_channel=False)
+            except Exception:
+                pass
+
+        # Participantes
+        msg_counts = await db.get_ticket_message_counts(ticket_id)
+        claimed_by_id = ticket.get("claimed_by")
+
+        # FIX 16: added_staff puede venir corrupto / no ser JSON válido en
+        # tickets viejos — antes esto tumbaba toda la función de cierre.
+        try:
+            added_staff_ids: list = json.loads(ticket.get("added_staff") or "[]")
+        except (json.JSONDecodeError, TypeError) as e:
+            print(f"[TicketsCog] added_staff inválido en ticket {ticket_id}: {e}")
+            added_staff_ids = []
+
+        all_staff_ids = list(
+            ({claimed_by_id} if claimed_by_id else set()) | set(added_staff_ids)
+        )
+
+        def fmt_mention(uid: int) -> str:
+            return f"<@{uid}>"
+
+        staff_lines = (
+            "\n".join(
+                f"👮 {_fmt_member_name(guild, uid)} ({msg_counts.get(uid, 0)} mensajes)"
+                for uid in all_staff_ids
+            )
+            or "👮 Sin staff asignado"
+        )
+        opener_line = (
+            f"👤 {_fmt_member_name(guild, ticket['user_id'])} "
+            f"({msg_counts.get(ticket['user_id'], 0)} mensajes)"
+        )
+        participants_text = f"{staff_lines}\n{opener_line}"
+        atendido = (
+            ", ".join(fmt_mention(uid) for uid in all_staff_ids) if all_staff_ids else "—"
+        )
+
+        # FIX 16: si falla la construcción del HTML (mensajes con contenido
+        # raro, etc.), seguimos el cierre sin transcript en vez de abortar.
+        try:
+            messages = await db.get_ticket_messages(ticket_id)
+            transcript_html = helpers.build_ticket_html(ticket, messages, guild.name)
+        except Exception as e:
+            print(f"[TicketsCog] error generando transcript del ticket {ticket_id}: {e}")
+            transcript_html = None
+
+        transcript_url: str | None = None
+        if transcript_html and log_ch_id:
+            log_ch = guild.get_channel(log_ch_id)
+            if log_ch:
+                try:
+                    t_msg = await log_ch.send(
+                        content=f"📄 **Transcript — Ticket #{ticket_id}**",
+                        file=discord.File(
+                            io.BytesIO(transcript_html.encode()),
+                            filename=f"ticket-{ticket_id}.html",
+                        ),
+                    )
+                    transcript_url = t_msg.jump_url
+                    await db.update_ticket(ticket_id, transcript_url=transcript_url)
+                except Exception as e:
+                    print(f"[TicketsCog] error enviando transcript al log del ticket {ticket_id}: {e}")
+
+        # DM al creador
+        dm_transcript_url: str | None = None
+        if opener:
+            total_msgs = sum(msg_counts.values())
+
+            if transcript_html:
+                try:
+                    file_msg = await opener.send(
+                        file=discord.File(
+                            io.BytesIO(transcript_html.encode()),
+                            filename=f"ticket-{ticket_id}.html",
+                        ),
+                    )
+                    dm_transcript_url = file_msg.attachments[0].url
+                    # FIX 19: persistir también el link del adjunto del DM,
+                    # para poder reconstruir un botón "Ver Transcript" que
+                    # el usuario final SÍ pueda abrir (a diferencia del
+                    # jump_url del canal de log, al que no tiene acceso).
+                    await db.update_ticket(ticket_id, dm_transcript_url=dm_transcript_url)
+                except Exception as e:
+                    print(f"[TicketsCog] error enviando adjunto de transcript por DM (ticket {ticket_id}): {e}")
+
+            # FIX 7: template de texto en vez de embed — ver _build_dm_transcript_text.
+            # Nota: para el link mostrado dentro del texto del DM se prioriza el
+            # adjunto de la propia DM (dm_transcript_url) porque es el archivo
+            # entregado directamente al usuario; para el botón "Ver Transcript"
+            # que sobrevive a un reinicio (ver RatingButtonDynamic) también se
+            # usa ahora dm_transcript_url en vez de transcript_url (ver FIX 19).
+            try:
+                dm_text = _build_dm_transcript_text(
+                    ticket=ticket,
+                    interaction=interaction,
+                    close_reason=close_reason,
+                    atendido=atendido,
+                    total_msgs=total_msgs,
+                    all_staff_ids=all_staff_ids,
+                    msg_counts=msg_counts,
+                    guild=guild,
+                    transcript_link=dm_transcript_url,
+                )
+                dm_view = RatingDMView(
+                    ticket_id, log_ch_id, dm_text,
+                    dm_transcript_url or transcript_url,
+                )
+                # FIX 17: allowed_mentions=none() — close_reason es texto
+                # libre (incluso el propio usuario puede cerrar su ticket y
+                # escribir el motivo), y va insertado tal cual dentro del
+                # TextDisplay. Sin esto, un motivo como "@everyone" o
+                # "<@&ID_DE_ROL>" dispararía una mención real en el DM.
+                await opener.send(view=dm_view, allowed_mentions=discord.AllowedMentions.none())
+            except Exception as e:
+                print(f"[TicketsCog] error enviando DM de cierre del ticket {ticket_id}: {e}")
+
+        # Log de cierre
+        if log_ch_id:
+            log_ch = guild.get_channel(log_ch_id)
+            if log_ch:
+                try:
+                    log_text = _build_close_log_text(
+                        ticket_id=ticket_id,
+                        ticket=ticket,
+                        claimed_by_id=claimed_by_id,
+                        participants_text=participants_text,
+                        transcript_url=transcript_url,
+                        close_reason=close_reason,
+                        interaction=interaction,
+                    )
+                    log_view = discord.ui.LayoutView()
+                    log_container = discord.ui.Container(accent_color=COLOR_ERROR)
+                    log_container.add_item(discord.ui.TextDisplay(log_text))
+                    log_view.add_item(log_container)
+                    # FIX 17: mismo motivo que en el DM — el log también
+                    # inserta close_reason tal cual dentro de un TextDisplay.
+                    await log_ch.send(view=log_view, allowed_mentions=discord.AllowedMentions.none())
+                except Exception as e:
+                    print(f"[TicketsCog] error enviando log de cierre del ticket {ticket_id}: {e}")
+
+        try:
+            await db.log_staff_action(guild.id, interaction.user.id, "ticket_close", ticket_id)
+        except Exception as e:
+            print(f"[TicketsCog] error registrando staff_action de cierre (ticket {ticket_id}): {e}")
+
+    except Exception as e:
+        # Red de seguridad final: cada sección de arriba ya tiene su propio
+        # try/except, pero si algo inesperado se escapa igual, lo logueamos
+        # y seguimos hacia el cierre del canal de todos modos.
+        print(f"[TicketsCog] error inesperado cerrando ticket {ticket_id}: {e}")
+
+    # FIX 15: esto ahora SIEMPRE se ejecuta, sin importar qué haya fallado
+    # arriba — es lo que faltaba para que el canal se borre de verdad.
+    close_embed = discord.Embed(
+        description=(
+            f"🔒 Ticket **#{ticket_id}** cerrado por {interaction.user.mention}.\n"
+            "Este canal se eliminará en **5 segundos**…"
+        ),
+        color=COLOR_ERROR,
+    )
+    await reply(embed=close_embed)
+
+    await asyncio.sleep(5)
+    try:
+        await interaction.channel.delete(reason=f"Ticket #{ticket_id} cerrado")
+    except Exception as e:
+        print(f"[TicketsCog] error borrando canal del ticket {ticket_id}: {e}")
+
+
+# ── Cog ───────────────────────────────────────────────────────────────────────
+
+class TicketsCog(commands.Cog, name="Tickets"):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.inactivity_check.start()
+
+    def cog_unload(self):
+        self.inactivity_check.cancel()
+
+    # ── /panel ─────────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="panel", description="Enviar el panel de tickets en un canal")
+    @app_commands.describe(canal="Canal donde publicar el panel (por defecto: aquí)")
+    @checks.is_admin()
+    async def ticket_panel(
+        self, interaction: discord.Interaction, canal: discord.TextChannel = None
+    ):
+        await interaction.response.defer(ephemeral=True)
+        target = canal or interaction.channel
+
+        # FIX 5: el panel ahora es un discord.ui.LayoutView (Components V2).
+        # No se pasa content ni embed — todo el texto vive dentro de la View
+        # (TextDisplay dentro de cada Section del Container).
+        await target.send(view=TicketPanelView())
+        await interaction.followup.send(f"✅ Panel enviado en {target.mention}.", ephemeral=True)
+
+    # ── /rename ────────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="rename", description="Renombrar el canal del ticket actual")
+    @app_commands.describe(nombre="Nuevo nombre para el canal")
+    @checks.is_staff()
+    async def ticket_rename(self, interaction: discord.Interaction, nombre: str):
+        ticket = await db.get_ticket_by_channel(interaction.channel_id)
+        if not ticket:
+            return await interaction.response.send_message(
+                "❌ Este canal no es un ticket.", ephemeral=True
+            )
+        await interaction.response.defer()
+        nombre_limpio = nombre.lower().replace(" ", "-")[:100]
+        try:
+            await interaction.channel.edit(name=nombre_limpio)
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "❌ No tengo permisos para renombrar este canal.", ephemeral=True
+            )
+        embed = discord.Embed(
+            description=f"✏️ Canal renombrado a **{nombre_limpio}** por {interaction.user.mention}.",
+            color=COLOR_SUCCESS,
+        )
+        await interaction.followup.send(embed=embed)
+
+    # ── /add ───────────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="add", description="Añadir a un usuario al ticket actual")
+    @app_commands.describe(usuario="Usuario al que dar acceso")
+    @checks.is_staff()
+    async def ticket_add(self, interaction: discord.Interaction, usuario: discord.Member):
+        ticket = await db.get_ticket_by_channel(interaction.channel_id)
+        if not ticket:
+            return await interaction.response.send_message(
+                "❌ Este canal no es un ticket.", ephemeral=True
+            )
+        try:
+            await interaction.channel.set_permissions(
+                usuario, view_channel=True, send_messages=True, read_message_history=True,
+            )
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                "❌ No tengo permisos para modificar este canal.", ephemeral=True
+            )
+        added: list = json.loads(ticket.get("added_staff") or "[]")
+        if usuario.id not in added:
+            added.append(usuario.id)
+            await db.update_ticket(ticket["id"], added_staff=json.dumps(added))
+        embed = discord.Embed(
+            description=f"✅ {usuario.mention} añadido al ticket por {interaction.user.mention}.",
+            color=COLOR_SUCCESS,
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ── /remove ────────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="remove", description="Eliminar a un usuario del ticket actual")
+    @app_commands.describe(usuario="Usuario al que quitar el acceso")
+    @checks.is_staff()
+    async def ticket_remove(self, interaction: discord.Interaction, usuario: discord.Member):
+        ticket = await db.get_ticket_by_channel(interaction.channel_id)
+        if not ticket:
+            return await interaction.response.send_message(
+                "❌ Este canal no es un ticket.", ephemeral=True
+            )
+        if usuario.id == ticket["user_id"]:
+            return await interaction.response.send_message(
+                "❌ No puedes eliminar al creador del ticket.", ephemeral=True
+            )
+        try:
+            await interaction.channel.set_permissions(usuario, overwrite=None)
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                "❌ No tengo permisos para modificar este canal.", ephemeral=True
+            )
+        embed = discord.Embed(
+            description=f"🚫 {usuario.mention} eliminado del ticket por {interaction.user.mention}.",
+            color=COLOR_ERROR,
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ── /close ─────────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="close", description="Cerrar el ticket actual")
+    @checks.is_staff()
+    async def ticket_close(self, interaction: discord.Interaction):
+        ticket = await db.get_ticket_by_channel(interaction.channel_id)
+        if not ticket:
+            return await interaction.response.send_message(
+                "❌ Este canal no es un ticket.", ephemeral=True
+            )
+        await interaction.response.send_modal(CloseReasonModal(ticket["id"]))
+
+    # ── /assign ────────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="assign", description="Asignar/reasignar el ticket a un miembro del staff")
+    @app_commands.describe(miembro="Miembro al que asignar el ticket")
+    @checks.is_staff()
+    async def ticket_assign(self, interaction: discord.Interaction, miembro: discord.Member):
+        """[FIX 25] BLOQUEANTE — antes este comando solo escribía la columna
+        assigned_to, que no se lee en ningún otro lugar del código (ni en
+        permisos del canal, ni en /history, ni en los templates de cierre).
+        claimed_by —el campo que de verdad controla quién "tiene" el ticket,
+        el bloqueo de permisos de los roles de staff, y quién aparece como
+        "Atendido por" en el DM/log de cierre— nunca se tocaba. El comando
+        parecía reasignar el ticket pero no cambiaba nada funcional.
+
+        Ahora /assign reasigna claimed_by de verdad y actualiza los
+        permisos del canal en consecuencia: revoca el acceso explícito de
+        escritura del staff anterior (si había uno distinto del nuevo) y
+        se lo otorga al nuevo. Si el ticket no estaba reclamado todavía,
+        aplica el mismo bloqueo de roles de staff que hace claim_btn.
+
+        Para evitar que cualquier staff le quite el ticket a otro con solo
+        /assign, reasignar un ticket YA reclamado por alguien más requiere
+        ser quien lo tiene reclamado o un Admin/Mod — mismo criterio que
+        /unclaim."""
+        ticket = await db.get_ticket_by_channel(interaction.channel_id)
+        if not ticket:
+            return await interaction.response.send_message(
+                "❌ Este canal no es un ticket.", ephemeral=True
+            )
+
+        current_claimed_by = ticket.get("claimed_by")
+
+        if current_claimed_by == miembro.id:
+            return await interaction.response.send_message(
+                f"❌ El ticket ya está asignado a {miembro.mention}.", ephemeral=True
+            )
+
+        is_admin_or_mod = (
+            interaction.user.guild_permissions.administrator
+            or interaction.user.guild_permissions.manage_channels
+            or any(r.id == checks.MOD_ROLE_ID for r in interaction.user.roles)
+        )
+        if (
+            current_claimed_by
+            and current_claimed_by != interaction.user.id
+            and not is_admin_or_mod
+        ):
+            claimer = interaction.guild.get_member(current_claimed_by)
+            claimer_text = claimer.mention if claimer else f"<@{current_claimed_by}>"
+            return await interaction.response.send_message(
+                f"❌ Este ticket ya fue reclamado por {claimer_text}. "
+                "Solo esa persona o un Admin/Mod pueden reasignarlo.",
+                ephemeral=True,
+            )
+
+        await db.update_ticket(ticket["id"], claimed_by=miembro.id, assigned_to=miembro.id)
+        await db.log_staff_action(
+            interaction.guild_id, interaction.user.id, "ticket_assign", ticket["id"],
+            details=f"reasignado a {miembro.id}",
+        )
+
+        config = await db.get_guild_config(interaction.guild_id)
+
+        # Revocar el acceso explícito de escritura del staff anterior (si
+        # había uno distinto del nuevo asignado) — de lo contrario seguiría
+        # pudiendo escribir en el canal aunque ya no sea quien lo atiende.
+        if current_claimed_by and current_claimed_by != miembro.id:
+            old_member = interaction.guild.get_member(current_claimed_by)
+            if old_member:
+                try:
+                    await interaction.channel.set_permissions(old_member, overwrite=None)
+                except Exception:
+                    pass
+
+        # Si el ticket no estaba reclamado todavía, aplicar el mismo
+        # bloqueo de roles de staff que hace claim_btn — /assign también
+        # sirve como un "reclamar para otro".
+        if not current_claimed_by:
+            roles_to_restrict: list[discord.Role] = []
+            staff_role_obj = interaction.guild.get_role(checks.STAFF_ROLE_ID)
+            if staff_role_obj:
+                roles_to_restrict.append(staff_role_obj)
+            for role_key in ("staff_role", "mod_role", "admin_role"):
+                rid = config.get(role_key)
+                if rid:
+                    role = interaction.guild.get_role(rid)
+                    if role and role not in roles_to_restrict:
+                        roles_to_restrict.append(role)
+            for role in roles_to_restrict:
+                try:
+                    await interaction.channel.set_permissions(
+                        role, view_channel=True, send_messages=False, read_message_history=True,
+                    )
+                except Exception:
+                    pass
+
+        try:
+            await interaction.channel.set_permissions(
+                miembro, view_channel=True, send_messages=True, read_message_history=True,
+            )
+        except Exception:
+            pass
+
+        opener = interaction.guild.get_member(ticket["user_id"])
+        if opener:
+            try:
+                await interaction.channel.set_permissions(
+                    opener, view_channel=True, send_messages=True, read_message_history=True,
+                )
+            except Exception:
+                pass
+
+        if current_claimed_by and current_claimed_by != miembro.id:
+            description = (
+                f"📌 Ticket reasignado de <@{current_claimed_by}> a {miembro.mention} "
+                f"por {interaction.user.mention}."
+            )
+        else:
+            description = f"📌 Ticket asignado a {miembro.mention} por {interaction.user.mention}."
+
+        embed = discord.Embed(description=description, color=COLOR_SUCCESS)
+        await interaction.response.send_message(embed=embed)
+
+    # ── /unclaim ───────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="unclaim", description="Liberar el reclamo del ticket actual")
+    @checks.is_staff()
+    async def ticket_unclaim(self, interaction: discord.Interaction):
+        """[FIX 24] Comando nuevo — antes no existía ninguna forma de
+        liberar un ticket ya reclamado. Un staff normal solo puede liberar
+        su PROPIO reclamo; un Admin/Mod puede forzar la liberación de
+        cualquier ticket (p. ej. si quien lo reclamó está desconectado o
+        de baja)."""
+        ticket = await db.get_ticket_by_channel(interaction.channel_id)
+        if not ticket:
+            return await interaction.response.send_message(
+                "❌ Este canal no es un ticket.", ephemeral=True
+            )
+        if not ticket.get("claimed_by"):
+            return await interaction.response.send_message(
+                "❌ Este ticket no está reclamado por nadie.", ephemeral=True
+            )
+
+        is_admin_or_mod = (
+            interaction.user.guild_permissions.administrator
+            or interaction.user.guild_permissions.manage_channels
+            or any(r.id == checks.MOD_ROLE_ID for r in interaction.user.roles)
+        )
+        if ticket["claimed_by"] == interaction.user.id:
+            released = await db.release_ticket(ticket["id"], expected_claimed_by=interaction.user.id)
+        elif is_admin_or_mod:
+            released = await db.release_ticket(ticket["id"])
+        else:
+            claimer = interaction.guild.get_member(ticket["claimed_by"])
+            claimer_text = claimer.mention if claimer else f"<@{ticket['claimed_by']}>"
+            return await interaction.response.send_message(
+                f"❌ Solo {claimer_text} o un Admin/Mod pueden liberar este ticket.",
+                ephemeral=True,
+            )
+
+        if not released:
+            return await interaction.response.send_message(
+                "❌ No se pudo liberar el ticket (puede que ya lo hayan liberado).",
+                ephemeral=True,
+            )
+
+        # Restaurar acceso de escritura a los roles de staff que claim_btn
+        # había bloqueado (send_messages=False) al reclamar el ticket.
+        config = await db.get_guild_config(interaction.guild_id)
+        roles_to_restore: list[discord.Role] = []
+        staff_role_obj = interaction.guild.get_role(checks.STAFF_ROLE_ID)
+        if staff_role_obj:
+            roles_to_restore.append(staff_role_obj)
+        for role_key in ("staff_role", "mod_role", "admin_role"):
+            rid = config.get(role_key)
+            if rid:
+                role = interaction.guild.get_role(rid)
+                if role and role not in roles_to_restore:
+                    roles_to_restore.append(role)
+        for role in roles_to_restore:
+            try:
+                await interaction.channel.set_permissions(
+                    role, view_channel=True, send_messages=True, read_message_history=True,
+                )
+            except Exception:
+                pass
+
+        await db.log_staff_action(
+            interaction.guild_id, interaction.user.id, "ticket_unclaim", ticket["id"]
+        )
+        embed = discord.Embed(
+            description=(
+                f"🔓 Ticket liberado por {interaction.user.mention}. "
+                "Ya puede ser reclamado nuevamente."
+            ),
+            color=COLOR_WARNING,
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ── /reopen ────────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="reopen", description="Reabrir un ticket cerrado")
+    @checks.is_staff()
+    async def ticket_reopen(self, interaction: discord.Interaction):
+        ticket = await db.get_ticket_by_channel(interaction.channel_id)
+        if not ticket:
+            return await interaction.response.send_message(
+                "❌ Este canal no es un ticket.", ephemeral=True
+            )
+        if ticket["status"] == "open":
+            return await interaction.response.send_message(
+                "❌ El ticket ya está abierto.", ephemeral=True
+            )
+        await db.update_ticket(ticket["id"], status="open", closed_at=None)
+
+        # FIX 22: reset defensivo envuelto en su propio try/except. Antes,
+        # un fallo acá (columna inexistente, error de conexión, etc.)
+        # tumbaba todo el comando /reopen ANTES de restaurar permisos del
+        # canal y de responder al staff — dejando el ticket "reabierto" en
+        # apariencia (el UPDATE de arriba ya había corrido) pero sin
+        # permisos restaurados y sin ninguna respuesta visible para quien
+        # ejecutó el comando. Normalmente ya queda en 0 al cerrar (ver
+        # _close_ticket), pero esto cubre tickets de antes de que
+        # existieran estas columnas o de un cierre fallido a medias.
+        try:
+            await db.reset_ticket_notifications(ticket["id"])
+        except Exception as e:
+            print(f"[TicketsCog] error reseteando notificaciones al reabrir ticket {ticket['id']}: {e}")
+
+        # FIX 4: volver a registrar en cache al reabrir
+        _ticket_channel_cache[interaction.channel_id] = ticket["id"]
+
+        opener = interaction.guild.get_member(ticket["user_id"])
+        if opener:
+            try:
+                await interaction.channel.set_permissions(
+                    opener, view_channel=True, send_messages=True, read_message_history=True,
+                )
+            except Exception:
+                pass
+        staff_role_obj = interaction.guild.get_role(checks.STAFF_ROLE_ID)
+        if staff_role_obj:
+            try:
+                await interaction.channel.set_permissions(
+                    staff_role_obj, view_channel=True, send_messages=True, read_message_history=True,
+                )
+            except Exception:
+                pass
+        embed = discord.Embed(description="🔓 Ticket reabierto.", color=COLOR_SUCCESS)
+        await interaction.response.send_message(embed=embed)
+
+    # ── /delete ────────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="delete", description="Eliminar el canal del ticket sin cerrar")
+    @checks.is_mod()
+    async def ticket_delete(self, interaction: discord.Interaction):
+        ticket = await db.get_ticket_by_channel(interaction.channel_id)
+        if not ticket:
+            return await interaction.response.send_message(
+                "❌ Este canal no es un ticket.", ephemeral=True
+            )
+        await interaction.response.send_message("🗑️ Eliminando ticket en 5 segundos…", ephemeral=True)
+
+        # FIX 4: invalidar cache
+        _ticket_channel_cache.pop(interaction.channel_id, None)
+
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete(
+                reason=f"Ticket #{ticket['id']} eliminado por {interaction.user}"
+            )
+        except Exception:
+            pass
+
+    # ── /history ───────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="history", description="Ver historial de tickets")
+    @app_commands.describe(usuario="[Solo staff] Ver tickets de este usuario")
+    async def ticket_history(
+        self, interaction: discord.Interaction, usuario: discord.Member = None
+    ):
+        await interaction.response.defer(ephemeral=True)
+        is_staff = (
+            interaction.user.guild_permissions.administrator
+            or any(r.id == checks.STAFF_ROLE_ID for r in interaction.user.roles)
+            or any(r.id == checks.MOD_ROLE_ID for r in interaction.user.roles)
+        )
+        if usuario and not is_staff:
+            return await interaction.followup.send(
+                "❌ Solo el staff puede ver el historial de otros usuarios.", ephemeral=True,
+            )
+        target = usuario or interaction.user
+        tickets = await db.get_user_tickets(interaction.guild_id, target.id)
+        if not tickets:
+            noun = "Tú no tienes" if target == interaction.user else f"{target} no tiene"
+            return await interaction.followup.send(f"{noun} tickets registrados.")
+
+        embed = discord.Embed(
+            title=f"📋 Historial de tickets — {target.display_name}",
+            color=COLOR_TICKET,
+        )
+        for t in tickets[:10]:
+            status_icon = "🟢" if t["status"] == "open" else "🔴"
+            cat_label = CATEGORY_LABELS.get(t["category"], t["category"])
+            transcript_link = (
+                f" • [📄 Transcript]({t['transcript_url']})" if t.get("transcript_url") else ""
+            )
+            embed.add_field(
+                name=f"{status_icon} #{t['id']} — {cat_label}",
+                value=f"**Abierto:** {t['opened_at'][:10]}{transcript_link}",
+                inline=False,
+            )
+        if len(tickets) > 10:
+            embed.set_footer(text=f"Mostrando 10 de {len(tickets)} tickets")
+        await interaction.followup.send(embed=embed)
+
+    # ── /setup ─────────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="setup", description="Configurar el sistema de tickets")
+    @app_commands.describe(
+        categoria="Categoría de Discord para los tickets",
+        log_canal="Canal donde enviar los logs de tickets",
+    )
+    @checks.is_admin()
+    async def ticket_setup(
+        self,
+        interaction: discord.Interaction,
+        categoria: discord.CategoryChannel,
+        log_canal: discord.TextChannel = None,
+    ):
+        await db.set_guild_config(
+            interaction.guild_id,
+            ticket_category=categoria.id,
+            ticket_log_channel=log_canal.id if log_canal else None,
+        )
+        msg = f"✅ Categoría configurada: **{categoria.name}**"
+        if log_canal:
+            msg += f" | Log: {log_canal.mention}"
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    # ── Listener: registrar mensajes ───────────────────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or not message.guild:
+            return
+
+        # FIX 4: cache de canales — evita un SELECT por cada mensaje en el servidor.
+        channel_id = message.channel.id
+        if channel_id not in _ticket_channel_cache:
+            ticket = await db.get_ticket_by_channel(channel_id)
+            _ticket_channel_cache[channel_id] = ticket["id"] if ticket else None
+
+        ticket_id = _ticket_channel_cache[channel_id]
+        if ticket_id is None:
+            return
+
+        ticket = await db.get_ticket(ticket_id)
+        if not ticket or ticket["status"] != "open":
+            return
+
+        await db.log_ticket_message(
+            ticket["id"],
+            message.author.id,
+            str(message.author),
+            message.content or "[adjunto]",
+        )
+        await db.update_ticket(ticket["id"], last_message_at=datetime.utcnow().isoformat())
+        if ticket["user_id"] != message.author.id and not ticket.get("first_response_at"):
+            if (
+                any(r.id == checks.STAFF_ROLE_ID for r in message.author.roles)
+                or message.author.guild_permissions.manage_channels
+            ):
+                await db.update_ticket(
+                    ticket["id"], first_response_at=datetime.utcnow().isoformat()
+                )
+
+    # ── Tarea de inactividad ───────────────────────────────────────────────────
+
+    @tasks.loop(minutes=30)
+    async def inactivity_check(self):
+        try:
+            # FIX 14: el filtro "ya notificado" se aplica directamente en la
+            # consulta a la DB (notified_column), en vez de un set en
+            # memoria que se perdía en cada reinicio del bot. Así un ticket
+            # que ya estaba inactivo ANTES de un reinicio no vuelve a
+            # disparar el aviso una vez de más.
+            inactive = await db.get_inactive_tickets(
+                TICKET_INACTIVITY_HOURS, notified_column="notified_inactive"
+            )
+            for ticket in inactive:
+                channel = self.bot.get_channel(ticket["channel_id"])
+                if channel:
+                    embed = discord.Embed(
+                        title="⏰ Ticket inactivo",
+                        description=(
+                            f"Este ticket lleva más de **{TICKET_INACTIVITY_HOURS}h** sin actividad.\n"
+                            "Usa el botón **Cerrar 🔒** si ya fue resuelto."
+                        ),
+                        color=COLOR_WARNING,
+                    )
+                    try:
+                        await channel.send(embed=embed)
+                        await db.mark_ticket_notified_inactive(ticket["id"])
+                    except Exception:
+                        pass
+
+            escalated = await db.get_inactive_tickets(
+                TICKET_ESCALATE_HOURS, notified_column="notified_escalated"
+            )
+            for ticket in escalated:
+                config = await db.get_guild_config(ticket["guild_id"])
+                admin_rid = config.get("admin_role")
+                channel = self.bot.get_channel(ticket["channel_id"])
+                if channel and admin_rid:
+                    guild = self.bot.get_guild(ticket["guild_id"])
+                    role = guild.get_role(admin_rid) if guild else None
+                    if role:
+                        embed = discord.Embed(
+                            title="🚨 Ticket escalado",
+                            description=(
+                                f"Ticket **#{ticket['id']}** sin respuesta por "
+                                f"{TICKET_ESCALATE_HOURS}h."
+                            ),
+                            color=COLOR_ERROR,
+                        )
+                        try:
+                            await channel.send(content=role.mention, embed=embed)
+                            await db.mark_ticket_notified_escalated(ticket["id"])
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"[TicketsCog] inactivity_check error: {e}")
+
+    @inactivity_check.before_loop
+    async def before_inactivity(self):
+        await self.bot.wait_until_ready()
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(TicketsCog(bot))
+
+    # FIX 2: re-registrar Views persistentes al arrancar el bot para que
+    # los botones del panel y de control sigan funcionando tras un reinicio.
+    # discord.py necesita que cada View persistente (timeout=None) esté
+    # registrada con bot.add_view() para que los custom_ids se puedan
+    # mapear a sus callbacks aunque el bot no haya enviado ese mensaje.
+    #
+    # TicketPanelView y TicketControlView SÍ pueden seguir usando un
+    # ticket_id/valores dummy sin problema, porque sus callbacks resuelven
+    # el ticket real por interaction.channel_id (ver claim_btn y, tras el
+    # FIX 9, también close_btn). El custom_id de estos botones es
+    # intencionalmente el mismo en todos los canales.
+    bot.add_view(TicketPanelView())
+    bot.add_view(TicketControlView(ticket_id=0))  # dummy: el ticket real se
+    # resuelve siempre por canal dentro de los callbacks, nunca por este id.
+
+    # FIX 10: el botón de valorar YA NO se registra como una View con
+    # ticket_id dummy (RatingDMView(ticket_id=0, ...) causaba que valorar
+    # cualquier ticket tras un reinicio corrompiera el DM). En su lugar se
+    # registra la clase de DynamicItem una sola vez; discord.py reconstruye
+    # la instancia correcta por cada interacción a partir del ticket_id
+    # codificado en su propio custom_id.
+    bot.add_dynamic_items(RatingButtonDynamic)

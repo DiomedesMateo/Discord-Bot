@@ -1,0 +1,417 @@
+    """
+    Cog: Birthdays — Sistema de cumpleaños.
+    Los usuarios registran su fecha una sola vez (irreversible para ellos).
+    Los administradores pueden corregir una fecha ya registrada con /birthday admin edit.
+    Tarea diaria a la 1:00 AM (hora de Santo Domingo, UTC-4): el bot envía un DM
+    al usuario el día de su cumpleaños.
+
+    FIXES aplicados:
+      [FIX 1] Variable local 'checks' en admin_test() shadowa cualquier
+              importación futura del módulo utils.checks. Renombrada a
+              'diagnostics' para evitar el conflicto y mejorar la claridad.
+
+      [FIX 2] Race condition en BirthdayConfirmView: si el usuario abría
+              el modal dos veces y pulsaba "Confirmar" en ambos casi
+              simultáneamente, ambos pasaban el check `if existing` antes
+              de que cualquiera escribiera, resultando en dos set_birthday
+              para el mismo usuario. Ahora se usa un asyncio.Lock por
+              user_id para serializar la operación leer → escribir.
+    """
+
+    import asyncio
+    import discord
+    from discord import app_commands
+    from discord.ext import commands, tasks
+    from datetime import datetime, time, timezone, timedelta
+    import database.db as db
+    from config import COLOR_SUCCESS, COLOR_WARNING
+
+    SANTO_DOMINGO_TZ = timezone(timedelta(hours=-4))
+
+    # FIX 2: locks por user_id para serializar la confirmación de cumpleaños
+    _birthday_locks: dict[int, asyncio.Lock] = {}
+
+    def _get_birthday_lock(user_id: int) -> asyncio.Lock:
+        if user_id not in _birthday_locks:
+            _birthday_locks[user_id] = asyncio.Lock()
+        return _birthday_locks[user_id]
+
+
+    def parse_birthday(fecha: str) -> str:
+        """Valida y normaliza una fecha en formato DD/MM.
+        Usa un año bisiesto (2024) como ancla para que 29/02 sea válido.
+        Lanza ValueError si el formato o la fecha no son válidos.
+        """
+        parts = fecha.strip().split("/")
+        if len(parts) != 2:
+            raise ValueError("Formato incorrecto")
+        day, month = int(parts[0]), int(parts[1])
+        datetime(2024, month, day)
+        return f"{day:02d}/{month:02d}"
+
+
+    def days_until_birthday(birthday_str: str, now: datetime) -> tuple[int, datetime]:
+        """Calcula cuántos días faltan para el próximo cumpleaños."""
+        day, month = (int(p) for p in birthday_str.split("/"))
+        today = now.date()
+
+        def safe_date(year: int, month: int, day: int):
+            try:
+                return datetime(year, month, day).date()
+            except ValueError:
+                return datetime(year, month, 28).date()
+
+        target = safe_date(today.year, month, day)
+        if target < today:
+            target = safe_date(today.year + 1, month, day)
+
+        return (target - today).days, target
+
+
+    class BirthdayConfirmView(discord.ui.View):
+        def __init__(self, birthday_str: str):
+            super().__init__(timeout=60)
+            self.birthday_str = birthday_str
+
+        @discord.ui.button(label="✅ Confirmar — es permanente", style=discord.ButtonStyle.success)
+        async def confirm(self, interaction: discord.Interaction, _):
+            # FIX 2: lock por user_id para serializar leer → escribir
+            # y evitar doble registro si el usuario confirma dos veces a la vez.
+            async with _get_birthday_lock(interaction.user.id):
+                existing = await db.get_birthday(interaction.user.id)
+                if existing:
+                    await interaction.response.edit_message(
+                        content="❌ Ya tienes un cumpleaños registrado. No puedes cambiarlo (solo un administrador puede corregirlo).",
+                        embed=None, view=None,
+                    )
+                    self.stop()
+                    return
+                await db.set_birthday(interaction.user.id, self.birthday_str)
+
+            self.stop()
+            embed = discord.Embed(
+                title="🎂 ¡Cumpleaños registrado!",
+                description=(
+                    f"Tu cumpleaños **{self.birthday_str}** ha sido guardado de forma permanente.\n"
+                    "El día de tu cumpleaños te enviaré un mensaje privado para felicitarte. 🎉\n\n"
+                    "Si te equivocaste al escribir la fecha, pide a un administrador que la corrija."
+                ),
+                color=COLOR_SUCCESS,
+            )
+            await interaction.response.edit_message(embed=embed, view=None)
+
+        @discord.ui.button(label="❌ Cancelar", style=discord.ButtonStyle.secondary)
+        async def cancel(self, interaction: discord.Interaction, _):
+            self.stop()
+            await interaction.response.edit_message(
+                content="Cancelado. Puedes volver a usar `/birthday set` cuando quieras.",
+                embed=None, view=None,
+            )
+
+
+    class AdminEditConfirmView(discord.ui.View):
+        """Confirmación para que un admin sobreescriba la fecha de otro usuario."""
+
+        def __init__(self, target: discord.abc.User, old_birthday: str | None, new_birthday: str):
+            super().__init__(timeout=60)
+            self.target      = target
+            self.old_birthday = old_birthday
+            self.new_birthday = new_birthday
+
+        @discord.ui.button(label="✅ Confirmar cambio", style=discord.ButtonStyle.success)
+        async def confirm(self, interaction: discord.Interaction, _):
+            await db.set_birthday(self.target.id, self.new_birthday)
+            self.stop()
+            embed = discord.Embed(
+                title="🛠️ Cumpleaños actualizado por un administrador",
+                description=(
+                    f"Usuario: **{self.target.mention}**\n"
+                    f"Fecha anterior: **{self.old_birthday or 'ninguna'}**\n"
+                    f"Fecha nueva: **{self.new_birthday}**"
+                ),
+                color=COLOR_SUCCESS,
+            )
+            await interaction.response.edit_message(embed=embed, view=None)
+
+        @discord.ui.button(label="❌ Cancelar", style=discord.ButtonStyle.secondary)
+        async def cancel(self, interaction: discord.Interaction, _):
+            self.stop()
+            await interaction.response.edit_message(
+                content="Cancelado. No se modificó ningún dato.",
+                embed=None, view=None,
+            )
+
+
+    class BirthdaysCog(commands.Cog, name="Birthdays"):
+        def __init__(self, bot: commands.Bot):
+            self.bot = bot
+            self.birthday_check.start()
+
+        def cog_unload(self):
+            self.birthday_check.cancel()
+
+        birthday_group = app_commands.Group(
+            name="birthday", description="Sistema de cumpleaños"
+        )
+        admin_group = app_commands.Group(
+            name="admin",
+            description="Comandos de administrador para cumpleaños",
+            parent=birthday_group,
+            default_permissions=discord.Permissions(administrator=True),
+        )
+
+        # ── /birthday set ──────────────────────────────────────────────────────────
+
+        @birthday_group.command(
+            name="set",
+            description="Registrar tu fecha de cumpleaños (solo una vez, permanente)",
+        )
+        @app_commands.describe(fecha="Tu cumpleaños en formato DD/MM  (ejemplo: 25/06)")
+        async def birthday_set(self, interaction: discord.Interaction, fecha: str):
+            existing = await db.get_birthday(interaction.user.id)
+            if existing:
+                return await interaction.response.send_message(
+                    f"❌ Ya tienes un cumpleaños registrado: **{existing['birthday']}**.\n"
+                    "Esta fecha **no puede modificarse** por ti mismo. Pide a un administrador "
+                    "que use `/birthday admin edit` si necesitas corregirla.",
+                    ephemeral=True,
+                )
+
+            try:
+                birthday_str = parse_birthday(fecha)
+            except ValueError:
+                return await interaction.response.send_message(
+                    "❌ Fecha inválida. Usa el formato **DD/MM** con una fecha real — ejemplo: `25/06`",
+                    ephemeral=True,
+                )
+
+            embed = discord.Embed(
+                title="⚠️ Advertencia — Acción permanente",
+                description=(
+                    f"Estás a punto de registrar tu cumpleaños como **{birthday_str}**.\n\n"
+                    "🔒 **Esta acción es irreversible.** Una vez confirmada, no podrás cambiar ni "
+                    "eliminar tu fecha de cumpleaños por ti mismo (solo un administrador podrá "
+                    "corregirla en caso de error).\n\n"
+                    "¿Deseas continuar?"
+                ),
+                color=COLOR_WARNING,
+            )
+            view = BirthdayConfirmView(birthday_str)
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+        # ── /birthday ver ──────────────────────────────────────────────────────────
+
+        @birthday_group.command(name="ver", description="Consultar tu cumpleaños registrado")
+        async def birthday_ver(self, interaction: discord.Interaction):
+            existing = await db.get_birthday(interaction.user.id)
+            if not existing:
+                return await interaction.response.send_message(
+                    "No tienes ningún cumpleaños registrado. Usa `/birthday set DD/MM`.",
+                    ephemeral=True,
+                )
+            await interaction.response.send_message(
+                f"🎂 Tu cumpleaños registrado es: **{existing['birthday']}**",
+                ephemeral=True,
+            )
+
+        # ── /birthday faltan ───────────────────────────────────────────────────────
+
+        @birthday_group.command(
+            name="faltan",
+            description="Ver cuánto falta para tu cumpleaños (o el de otro usuario)",
+        )
+        @app_commands.describe(usuario="(Opcional) Consultar el cumpleaños de otro usuario")
+        async def birthday_faltan(
+            self, interaction: discord.Interaction, usuario: discord.User | None = None
+        ):
+            target_user = usuario or interaction.user
+            existing    = await db.get_birthday(target_user.id)
+
+            if not existing:
+                if target_user.id == interaction.user.id:
+                    return await interaction.response.send_message(
+                        "No tienes ningún cumpleaños registrado. Usa `/birthday set DD/MM`.",
+                        ephemeral=True,
+                    )
+                return await interaction.response.send_message(
+                    f"**{target_user.display_name}** no tiene ningún cumpleaños registrado.",
+                    ephemeral=True,
+                )
+
+            now  = datetime.now(SANTO_DOMINGO_TZ)
+            dias, _ = days_until_birthday(existing["birthday"], now)
+
+            if dias == 0:
+                mensaje = f"🎉 ¡Hoy es el cumpleaños de **{target_user.display_name}**! ({existing['birthday']})"
+            elif dias == 1:
+                mensaje = f"🎂 Falta **1 día** para el cumpleaños de **{target_user.display_name}** ({existing['birthday']})."
+            else:
+                mensaje = f"🎂 Faltan **{dias} días** para el cumpleaños de **{target_user.display_name}** ({existing['birthday']})."
+
+            await interaction.response.send_message(mensaje, ephemeral=True)
+
+        # ── /birthday admin edit ───────────────────────────────────────────────────
+
+        @admin_group.command(
+            name="edit",
+            description="[Admin] Corregir el cumpleaños registrado de un usuario",
+        )
+        @app_commands.describe(
+            usuario="Usuario cuyo cumpleaños quieres corregir",
+            fecha="Nueva fecha en formato DD/MM (ejemplo: 25/06)",
+        )
+        @app_commands.checks.has_permissions(administrator=True)
+        async def admin_edit(
+            self, interaction: discord.Interaction, usuario: discord.User, fecha: str
+        ):
+            try:
+                new_birthday = parse_birthday(fecha)
+            except ValueError:
+                return await interaction.response.send_message(
+                    "❌ Fecha inválida. Usa el formato **DD/MM** con una fecha real — ejemplo: `25/06`",
+                    ephemeral=True,
+                )
+
+            existing    = await db.get_birthday(usuario.id)
+            old_birthday = existing["birthday"] if existing else None
+
+            embed = discord.Embed(
+                title="⚠️ Confirmar corrección de cumpleaños",
+                description=(
+                    f"Usuario: **{usuario.mention}**\n"
+                    f"Fecha actual: **{old_birthday or 'sin registrar'}**\n"
+                    f"Fecha nueva: **{new_birthday}**\n\n"
+                    "Esta acción sobreescribirá el registro de este usuario. ¿Continuar?"
+                ),
+                color=COLOR_WARNING,
+            )
+            view = AdminEditConfirmView(usuario, old_birthday, new_birthday)
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+        @admin_edit.error
+        async def admin_edit_error(
+            self, interaction: discord.Interaction, error: app_commands.AppCommandError
+        ):
+            if isinstance(error, app_commands.MissingPermissions):
+                await interaction.response.send_message(
+                    "❌ Necesitas el permiso de **Administrador** para usar este comando.",
+                    ephemeral=True,
+                )
+            else:
+                raise error
+
+        # ── /birthday admin test ───────────────────────────────────────────────────
+
+        @staticmethod
+        def build_birthday_embed(user: discord.abc.User) -> discord.Embed:
+            embed = discord.Embed(
+                title="🎉 ¡FELIZ CUMPLEAÑOS!",
+                description=(
+                    f"🎂 ¡Feliz cumpleaños, **{user.display_name}**! 🎂\n\n"
+                    "Hoy celebramos un día muy especial: **tu cumpleaños**. Todo el equipo y la "
+                    "comunidad de **MineOrbit** te desean un día lleno de felicidad, buenos "
+                    "momentos y muchas sorpresas. 🚀\n\n"
+                    "🎁 Esperamos que disfrutes tu día al máximo junto a tus amigos y familiares.\n\n"
+                    "🌀 Gracias por formar parte de nuestra comunidad y compartir esta aventura "
+                    "con nosotros.\n\n"
+                    "🎉 ¡Que tengas un increíble cumpleaños y un año lleno de éxitos!\n\n"
+                    "❤️ De parte de toda la comunidad de **MineOrbit Network**."
+                ),
+                color=0xFF69B4,
+            )
+            embed.set_thumbnail(url=user.display_avatar.url)
+            return embed
+
+        @admin_group.command(
+            name="test",
+            description="[Admin] Envía un DM de prueba de cumpleaños a ti mismo",
+        )
+        @app_commands.checks.has_permissions(administrator=True)
+        async def admin_test(self, interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+
+            # FIX 1: renombrada de 'checks' a 'diagnostics' para evitar
+            # shadowing del módulo utils.checks si se importara en el futuro.
+            diagnostics: list[str] = []
+
+            try:
+                existing = await db.get_birthday(interaction.user.id)
+                diagnostics.append(
+                    f"✅ Conexión a base de datos OK "
+                    f"(tu registro: **{existing['birthday'] if existing else 'ninguno'}**)"
+                )
+            except Exception as e:
+                diagnostics.append(f"❌ Error consultando la base de datos: `{e}`")
+
+            try:
+                now       = datetime.now(SANTO_DOMINGO_TZ)
+                today_str = f"{now.day:02d}/{now.month:02d}"
+                todays    = await db.get_today_birthdays(today_str)
+                diagnostics.append(
+                    f"✅ `get_today_birthdays` OK "
+                    f"({len(todays)} cumpleaños hoy: {today_str})"
+                )
+            except Exception as e:
+                diagnostics.append(f"❌ Error en `get_today_birthdays`: `{e}`")
+
+            embed = self.build_birthday_embed(interaction.user)
+            try:
+                await interaction.user.send(embed=embed)
+                diagnostics.append("✅ DM enviado correctamente — revisa tus mensajes privados")
+            except discord.Forbidden:
+                diagnostics.append(
+                    "❌ No se pudo enviar el DM "
+                    "(tienes los DMs cerrados para este servidor o para el bot)"
+                )
+            except Exception as e:
+                diagnostics.append(f"❌ Error inesperado enviando el DM: `{e}`")
+
+            all_ok = all(d.startswith("✅") for d in diagnostics)
+            result_embed = discord.Embed(
+                title="🧪 Test del sistema de cumpleaños",
+                description="\n".join(diagnostics),
+                color=COLOR_SUCCESS if all_ok else COLOR_WARNING,
+            )
+            await interaction.followup.send(embed=result_embed, ephemeral=True)
+
+        @admin_test.error
+        async def admin_test_error(
+            self, interaction: discord.Interaction, error: app_commands.AppCommandError
+        ):
+            if isinstance(error, app_commands.MissingPermissions):
+                await interaction.response.send_message(
+                    "❌ Necesitas el permiso de **Administrador** para usar este comando.",
+                    ephemeral=True,
+                )
+            else:
+                raise error
+
+        # ── Tarea diaria ───────────────────────────────────────────────────────────
+
+        @tasks.loop(time=time(hour=1, minute=0, tzinfo=SANTO_DOMINGO_TZ))
+        async def birthday_check(self):
+            now       = datetime.now(SANTO_DOMINGO_TZ)
+            today_str = f"{now.day:02d}/{now.month:02d}"
+            birthdays = await db.get_today_birthdays(today_str)
+
+            for row in birthdays:
+                user = self.bot.get_user(row["user_id"])
+                if not user:
+                    try:
+                        user = await self.bot.fetch_user(row["user_id"])
+                    except Exception:
+                        continue
+
+                embed = self.build_birthday_embed(user)
+                try:
+                    await user.send(embed=embed)
+                except discord.Forbidden:
+                    pass
+
+        @birthday_check.before_loop
+        async def before_birthday_check(self):
+            await self.bot.wait_until_ready()
+
+
+    async def setup(bot: commands.Bot):
+        await bot.add_cog(BirthdaysCog(bot))

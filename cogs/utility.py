@@ -1,0 +1,1479 @@
+"""
+Cog: Utility — Comandos de utilidad pública.
+/help        — muestra los comandos disponibles, agrupados por Cog.
+/info        — información del servidor MineOrbit Network
+/statschannel setup  — configura el canal de voz de estadísticas de miembros
+/statschannel remove — elimina el canal de voz de estadísticas
+
+El canal de voz de estadísticas muestra el total de miembros del servidor
+en su nombre y se actualiza automáticamente cada 30 minutos. Los usuarios
+no pueden unirse (solo pueden verlo), igual que StatBot.
+
+"""
+
+import asyncio
+import io
+import json
+import logging
+import os
+import sqlite3
+import tempfile
+import zipfile
+import datetime
+import aiohttp
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+from mcstatus import JavaServer
+from database import db
+from utils import checks
+from config import (
+    COLOR_INFO, COLOR_TICKET, COLOR_SUCCESS,
+    MC_SERVER_HOST, MC_SERVER_PORT, MC_STATUS_REFRESH_MINUTES,
+)
+
+logger = logging.getLogger(__name__)
+
+# ── Backups: acceso restringido + recordatorio ───────────────────────────────
+BACKUP_USER_ID = 719935387056865393   # único usuario que puede usar /backup *
+BACKUP_REMINDER_DAYS = 7              # cada cuántos días se le recuerda hacer el backup
+
+
+def _backup_user_only():
+    """Check de slash command: solo BACKUP_USER_ID (ni siquiera otros owners/admins)."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.user.id == BACKUP_USER_ID:
+            return True
+        raise app_commands.CheckFailure(
+            "Solo el responsable de backups puede usar estos comandos."
+        )
+    return app_commands.check(predicate)
+
+
+def _build_db_backup_zip(db_path: str) -> tuple[bytes, str]:
+    """Copia consistente de la BD (API de backup de SQLite; incluye lo que
+    aún esté en el WAL) comprimida en un .zip en memoria. La copia temporal
+    se crea y se borra dentro de un directorio temporal."""
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    db_name = f"discord_bot_{stamp}.db"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_db = os.path.join(tmp, db_name)
+        src_conn = sqlite3.connect(db_path, timeout=30)
+        dst_conn = sqlite3.connect(tmp_db)
+        try:
+            src_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+            src_conn.close()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+            zf.write(tmp_db, arcname=db_name)
+    return buf.getvalue(), f"discord_bot_backup_{stamp}.zip"
+
+# Formato del nombre del canal. {count} se reemplaza por el total de miembros.
+STATS_CHANNEL_FORMAT = "👥 Miembros: {count}"
+
+# Mapeo Cog → (emoji, título, orden de aparición).
+COG_DISPLAY = {
+    "Utility":     ("🌐", "Servidor",    0),
+    "Tickets":     ("🎫", "Soporte",     1),
+    "Birthdays":   ("🎂", "Cumpleaños",  2),
+    "Giveaways":   ("🎉", "Sorteos",     3),
+    "Suggestions": ("💡", "Sugerencias", 4),
+    "Appeals":     ("⚖️", "Apelaciones", 5),
+    "StaffTools":  ("🛠️", "Staff", 6),
+    "Confessions": ("🤫", "Confesiones", 7),
+    "Invites":     ("📨", "Invitaciones", 8),
+    "VoiceHubs":   ("🔊", "Canales de voz", 9),
+}
+DEFAULT_EMOJI = "🔧"
+DEFAULT_ORDER = 99
+
+
+def _has_default_permissions_lock(
+    command: app_commands.Command | app_commands.Group,
+) -> bool:
+    """True si el comando o cualquier grupo padre tiene default_permissions."""
+    node = command
+    while node is not None:
+        if getattr(node, "default_permissions", None) is not None:
+            return True
+        node = node.parent
+    return False
+
+
+async def _passes_permission_checks(
+    command: app_commands.Command, interaction: discord.Interaction
+) -> bool:
+    """Evalúa los checks reales del comando contra el interaction actual."""
+    for predicate in command.checks:
+        try:
+            result = predicate(interaction)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if not result:
+                return False
+        except app_commands.CheckFailure:
+            return False
+        except TypeError as e:
+            logger.error(
+                "TypeError en check de /%s: %s. "
+                "Revisa la firma del check (debe aceptar un solo argumento: interaction).",
+                command.qualified_name, e,
+            )
+            raise
+        except Exception:
+            logger.warning(
+                "Error inesperado evaluando check de /%s — el comando se ocultará en /help.",
+                command.qualified_name, exc_info=True,
+            )
+            return False
+    return True
+
+
+class HelpPaginator(discord.ui.View):
+    """Botones ◀ ▶ para navegar las páginas de /help cuando no caben en un
+    solo embed (límite de Discord: 6000 caracteres totales por embed)."""
+
+    def __init__(self, pages: list[discord.Embed], author_id: int):
+        super().__init__(timeout=120)
+        self.pages = pages
+        self.index = 0
+        self.author_id = author_id
+        self.message: discord.Message | None = None
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.prev_button.disabled = self.index == 0
+        self.next_button.disabled = self.index >= len(self.pages) - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Este menú no es tuyo — usa `/help` para ver el tuyo.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="◀ Anterior", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+
+    @discord.ui.button(label="Siguiente ▶", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
+class UtilityCog(commands.Cog, name="Utility"):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.stats_update_loop.start()
+        self.mcstatus_panel_loop.start()
+        self.backup_reminder_loop.start()
+
+    def cog_unload(self):
+        self.stats_update_loop.cancel()
+        self.mcstatus_panel_loop.cancel()
+        self.backup_reminder_loop.cancel()
+
+    async def _build_command_lines(
+        self, interaction: discord.Interaction
+    ) -> dict[str, list[str]]:
+        lines_by_cog: dict[str, list[str]] = {}
+
+        for command in self.bot.tree.walk_commands():
+            if isinstance(command, app_commands.Group):
+                continue
+
+            if _has_default_permissions_lock(command):
+                guild_perms = getattr(interaction.user, "guild_permissions", None)
+                is_admin    = bool(guild_perms and guild_perms.administrator)
+                if not is_admin:
+                    continue
+
+            try:
+                if not await _passes_permission_checks(command, interaction):
+                    continue
+            except TypeError:
+                continue
+
+            cog_name = command.binding.qualified_name if command.binding else "General"
+            line     = f"`/{command.qualified_name}` — {command.description}"
+            lines_by_cog.setdefault(cog_name, []).append(line)
+
+        return lines_by_cog
+
+    # ── /help ──────────────────────────────────────────────────────────────────
+
+    async def _build_help_pages(
+        self, interaction: discord.Interaction
+    ) -> list[discord.Embed]:
+        """Arma los embeds de /help paginados. Cada campo ya viene recortado
+        a 1024 caracteres (límite de Discord por campo), pero además hay que
+        respetar el límite de 6000 caracteres del embed COMPLETO — por eso
+        se reparten los campos entre varias páginas en vez de un solo embed.
+        """
+        lines_by_cog = await self._build_command_lines(interaction)
+
+        def sort_key(cog_name: str):
+            _, _, order = COG_DISPLAY.get(cog_name, (None, None, DEFAULT_ORDER))
+            return (order, cog_name)
+
+        fields: list[tuple[str, str]] = []
+        for cog_name in sorted(lines_by_cog.keys(), key=sort_key):
+            emoji, title, _ = COG_DISPLAY.get(
+                cog_name, (DEFAULT_EMOJI, cog_name, DEFAULT_ORDER)
+            )
+            value = "\n".join(lines_by_cog[cog_name])
+            if len(value) > 1024:
+                value = value[:1000] + "\n…"
+            fields.append((f"{emoji} {title}", value))
+
+        title_text = "📖 Comandos disponibles"
+        description_text = "Aquí tienes todos los comandos que puedes usar en **MineOrbit Network**."
+        footer_text = "MineOrbit Network • Usa /info para ver la dirección IP del servidor"
+        # Margen de seguridad bajo el límite real de 6000 (título+descr.+campos+footer).
+        MAX_PAGE_CHARS = 5500
+        MAX_FIELDS_PER_PAGE = 25  # límite duro de Discord por embed
+
+        base_overhead = len(title_text) + len(description_text) + len(footer_text)
+        pages_fields: list[list[tuple[str, str]]] = [[]]
+        current_chars = base_overhead
+
+        for name, value in fields:
+            field_chars = len(name) + len(value)
+            page = pages_fields[-1]
+            if page and (
+                current_chars + field_chars > MAX_PAGE_CHARS
+                or len(page) >= MAX_FIELDS_PER_PAGE
+            ):
+                pages_fields.append([])
+                current_chars = base_overhead
+            pages_fields[-1].append((name, value))
+            current_chars += field_chars
+
+        total = len(pages_fields)
+        embeds = []
+        for i, page_fields in enumerate(pages_fields, start=1):
+            embed = discord.Embed(
+                title=title_text + (f" — Página {i}/{total}" if total > 1 else ""),
+                description=description_text,
+                color=COLOR_INFO,
+            )
+            for name, value in page_fields:
+                embed.add_field(name=name, value=value or "—", inline=False)
+            embed.set_footer(text=footer_text)
+            embeds.append(embed)
+
+        if not embeds:
+            embed = discord.Embed(title=title_text, description=description_text, color=COLOR_INFO)
+            embed.set_footer(text=footer_text)
+            embeds.append(embed)
+
+        return embeds
+
+    @app_commands.command(name="help", description="Ver los comandos disponibles")
+    async def help_cmd(self, interaction: discord.Interaction):
+        pages = await self._build_help_pages(interaction)
+
+        if len(pages) == 1:
+            return await interaction.response.send_message(embed=pages[0], ephemeral=True)
+
+        view = HelpPaginator(pages, interaction.user.id)
+        await interaction.response.send_message(embed=pages[0], view=view, ephemeral=True)
+        view.message = await interaction.original_response()
+
+    # ── /info ──────────────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="info", description="Información del servidor MineOrbit Network"
+    )
+    async def info_cmd(self, interaction: discord.Interaction):
+        embed = discord.Embed(
+            title="🌐 Información del Servidor",
+            description=(
+                "¡Gracias por tu interés en **MineOrbit Network**! 🌀\n\n"
+                "## 🎮 Dirección IP\n"
+                "```\nmineorbit.org\n```\n"
+                "## 🔗 Enlaces Oficiales\n"
+                "🌍 **Sitio Web:** https://mineorbit.org\n"
+                "🛒 **Tienda:** https://store.mineorbit.org\n\n"
+                "🚀 ¡Conéctate ahora y comienza tu aventura en MineOrbit!\n\n"
+                "-# 🌀 MineOrbit Network — Explore Beyond Limits."
+            ),
+            color=COLOR_TICKET,
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ── Canal de estadísticas ─────────────────────────────────────────────────
+
+    stats_group = app_commands.Group(
+        name="statschannel",
+        description="Canal de voz con estadísticas de miembros",
+    )
+
+    @stats_group.command(
+        name="setup",
+        description="Crear el canal de voz con el total de miembros del servidor",
+    )
+    @app_commands.describe(
+        categoria="Categoría donde crear el canal (opcional)",
+    )
+    @checks.is_owner()
+    async def statschannel_setup(
+        self,
+        interaction: discord.Interaction,
+        categoria: discord.CategoryChannel = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+
+        # Verificar si ya existe un canal configurado
+        config = await db.get_guild_config(guild.id)
+        existing_id = config.get("stats_channel_id")
+        if existing_id:
+            existing_ch = guild.get_channel(existing_id)
+            if existing_ch is None and existing_id:
+                # Canal no está en caché — intentar fetch para confirmar si existe
+                try:
+                    existing_ch = await guild.fetch_channel(existing_id)
+                except Exception:
+                    # Canal ya no existe en Discord — limpiar config y continuar
+                    await db.set_guild_config(guild.id, stats_channel_id=None)
+                    existing_ch = None
+            if existing_ch:
+                return await interaction.followup.send(
+                    f"❌ Ya tienes un canal de estadísticas configurado: {existing_ch.mention}\n"
+                    "Usa `/statschannel remove` primero si quieres reemplazarlo.",
+                    ephemeral=True,
+                )
+
+        # Permisos: todos pueden ver, nadie puede unirse
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=True,
+                connect=False,
+            ),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                manage_channels=True,
+            ),
+        }
+
+        nombre = STATS_CHANNEL_FORMAT.format(count=guild.member_count or 0)
+        try:
+            channel = await guild.create_voice_channel(
+                name=nombre,
+                category=categoria,
+                overwrites=overwrites,
+                reason="Canal de estadísticas de miembros — /statschannel setup",
+            )
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "❌ No tengo permisos para crear canales de voz.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            return await interaction.followup.send(
+                f"❌ Error al crear el canal: {e}", ephemeral=True
+            )
+
+        # Guardar el ID en la config del guild
+        await db.set_guild_config(guild.id, stats_channel_id=channel.id)
+
+        embed = discord.Embed(
+            title="✅ Canal de estadísticas creado",
+            description=(
+                f"Canal: {channel.mention}\n"
+                f"Nombre actual: **{nombre}**\n\n"
+                "El nombre se actualizará automáticamente cada **30 minutos**.\n"
+                "Los miembros pueden ver el canal pero no unirse."
+            ),
+            color=COLOR_SUCCESS,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @stats_group.command(
+        name="remove",
+        description="Eliminar el canal de voz de estadísticas",
+    )
+    @checks.is_owner()
+    async def statschannel_remove(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        guild  = interaction.guild
+        config = await db.get_guild_config(guild.id)
+        ch_id  = config.get("stats_channel_id")
+
+        if not ch_id:
+            return await interaction.followup.send(
+                "❌ No hay ningún canal de estadísticas configurado.",
+                ephemeral=True,
+            )
+
+        channel = guild.get_channel(ch_id)
+        if channel:
+            try:
+                await channel.delete(reason="Canal de estadísticas eliminado — /statschannel remove")
+            except discord.Forbidden:
+                return await interaction.followup.send(
+                    "❌ No tengo permisos para eliminar ese canal.", ephemeral=True
+                )
+            except Exception as e:
+                return await interaction.followup.send(
+                    f"❌ Error al eliminar el canal: {e}", ephemeral=True
+                )
+
+        # Limpiar de la config aunque el canal ya no existiera
+        await db.set_guild_config(guild.id, stats_channel_id=None)
+        await interaction.followup.send(
+            "✅ Canal de estadísticas eliminado.", ephemeral=True
+        )
+
+    # ── Loop de actualización ─────────────────────────────────────────────────
+
+    @tasks.loop(minutes=30)
+    async def stats_update_loop(self):
+        """Actualiza el nombre del canal de estadísticas en cada guild
+        donde esté configurado. Discord limita los renames de canal a
+        2 por cada 10 minutos por canal, así que 30 minutos es seguro."""
+        for guild in self.bot.guilds:
+            try:
+                config = await db.get_guild_config(guild.id)
+                ch_id  = config.get("stats_channel_id")
+                if not ch_id:
+                    continue
+
+                channel = guild.get_channel(ch_id)
+                if not channel or not isinstance(channel, discord.VoiceChannel):
+                    # El canal fue eliminado manualmente — limpiar config
+                    await db.set_guild_config(guild.id, stats_channel_id=None)
+                    continue
+
+                nuevo_nombre = STATS_CHANNEL_FORMAT.format(count=guild.member_count or 0)
+                # Solo renombrar si el nombre cambió para no desperdiciar
+                # el rate limit de Discord (2 renames / 10 min por canal)
+                if channel.name != nuevo_nombre:
+                    await channel.edit(
+                        name=nuevo_nombre,
+                        reason="Actualización automática de estadísticas",
+                    )
+            except discord.Forbidden:
+                # El bot perdió permisos en ese canal — no hay nada que hacer
+                pass
+            except Exception as e:
+                logger.warning(
+                    "[UtilityCog] Error actualizando stats channel en guild %s: %s",
+                    guild.id, e,
+                )
+
+    @stats_update_loop.before_loop
+    async def before_stats_loop(self):
+        await self.bot.wait_until_ready()
+
+
+    # ── /servidor ─────────────────────────────────────────────────────────────
+
+    servidor_group = app_commands.Group(
+        name="servidor",
+        description="Información del servidor de Minecraft MineOrbit",
+    )
+
+    # ── Consulta directa por Server List Ping (protocolo estándar de
+    #    Minecraft, sin API de terceros ni plugin del lado del servidor) ──────
+
+    @staticmethod
+    async def _query_minecraft_server() -> dict:
+        """Consulta el servidor de Minecraft vía SLP (Server List Ping) y
+        devuelve un dict normalizado. Lanza excepción si no responde —
+        el llamador decide cómo mostrar el estado offline."""
+        server = await JavaServer.async_lookup(f"{MC_SERVER_HOST}:{MC_SERVER_PORT}")
+        status = await asyncio.wait_for(server.async_status(), timeout=10)
+
+        sample = getattr(status.players, "sample", None) or []
+        player_names = [p.name for p in sample]
+
+        motd = status.motd.to_plain() if hasattr(status.motd, "to_plain") else str(status.motd)
+
+        return {
+            "players_online": status.players.online,
+            "players_max": status.players.max,
+            "player_names": player_names,
+            "version": status.version.name,
+            "motd": motd.strip() or "—",
+            "latency_ms": status.latency,
+        }
+
+    @staticmethod
+    def _build_mcstatus_embed(data: dict | None, error: str | None = None) -> discord.Embed:
+        """Construye el embed de estado a partir del resultado de
+        `_query_minecraft_server`, o un embed offline si `error` está
+        seteado."""
+        if error is not None or data is None:
+            embed = discord.Embed(
+                title="🔴 MineOrbit Network — Offline",
+                description="El servidor parece estar **offline** o no responde en este momento.",
+                color=discord.Color.red(),
+            )
+            embed.set_footer(text=f"{MC_SERVER_HOST} • Server List Ping")
+            embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+            return embed
+
+        players_online = data["players_online"]
+        players_max    = data["players_max"]
+
+        bar_filled = int(players_online / players_max * 10) if players_max else 0
+        bar_filled = max(0, min(bar_filled, 10))
+        bar = "🟩" * bar_filled + "⬜" * (10 - bar_filled)
+
+        embed = discord.Embed(
+            title="🟢 MineOrbit Network — Online",
+            color=discord.Color.green(),
+        )
+        embed.add_field(
+            name="👥 Jugadores",
+            value=f"{bar}\n`{players_online} / {players_max}`",
+            inline=False,
+        )
+        embed.add_field(name="🖥️ Versión", value=f"`{data['version']}`", inline=True)
+        embed.add_field(name="📶 Ping",    value=f"`{data['latency_ms']:.0f} ms`", inline=True)
+        embed.add_field(name="🌐 IP",      value=f"`{MC_SERVER_HOST}`", inline=True)
+
+        if data["player_names"]:
+            names = ", ".join(f"`{n}`" for n in data["player_names"][:20])
+            embed.add_field(name="🎮 Jugadores conectados", value=names, inline=False)
+
+        embed.add_field(name="📋 MOTD", value=f"```{data['motd']}```", inline=False)
+        embed.set_footer(text=f"{MC_SERVER_HOST} • Server List Ping")
+        embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+        return embed
+
+    @app_commands.command(
+        name="mcstatus",
+        description="Muestra en vivo el estado del servidor de Minecraft MineOrbit",
+    )
+    @app_commands.checks.cooldown(1, 10.0, key=lambda i: (i.guild_id, i.user.id))
+    async def mcstatus_cmd(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer()
+        except Exception:
+            return
+
+        try:
+            data = await self._query_minecraft_server()
+            embed = self._build_mcstatus_embed(data)
+        except asyncio.TimeoutError:
+            embed = self._build_mcstatus_embed(None, error="timeout")
+        except Exception as e:
+            logger.warning("[mcstatus] no se pudo consultar %s:%s — %s", MC_SERVER_HOST, MC_SERVER_PORT, e)
+            embed = self._build_mcstatus_embed(None, error=str(e))
+
+        await interaction.followup.send(embed=embed)
+
+    # ── Panel de estado auto-actualizable ────────────────────────────────────
+
+    @servidor_group.command(
+        name="panel-setup",
+        description="[Admin] Crea un panel de estado que se autoactualiza en este canal",
+    )
+    @checks.is_owner()
+    @app_commands.describe(canal="Canal donde publicar el panel (por defecto: aquí)")
+    async def servidor_panel_setup(
+        self, interaction: discord.Interaction, canal: discord.TextChannel = None
+    ):
+        await interaction.response.defer(ephemeral=True)
+        target = canal or interaction.channel
+
+        try:
+            data = await self._query_minecraft_server()
+            embed = self._build_mcstatus_embed(data)
+        except Exception as e:
+            embed = self._build_mcstatus_embed(None, error=str(e))
+
+        try:
+            message = await target.send(content="📡 **Estado del servidor**", embed=embed)
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "❌ No tengo permisos para enviar mensajes en ese canal.", ephemeral=True
+            )
+
+        try:
+            await message.pin(reason="Panel de estado del servidor — /servidor panel-setup")
+        except Exception as e:
+            logger.warning("[mcstatus panel] no se pudo fijar el mensaje: %s", e)
+
+        await db.set_guild_config(
+            interaction.guild_id,
+            mc_status_channel_id=target.id,
+            mc_status_message_id=message.id,
+        )
+        await interaction.followup.send(
+            f"✅ Panel de estado creado y fijado en {target.mention}. Se actualizará cada "
+            f"{MC_STATUS_REFRESH_MINUTES} minutos.",
+            ephemeral=True,
+        )
+
+    @servidor_group.command(
+        name="panel-remove",
+        description="[Admin] Elimina el panel de estado auto-actualizable",
+    )
+    @checks.is_owner()
+    async def servidor_panel_remove(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        config = await db.get_guild_config(interaction.guild_id)
+        ch_id  = config.get("mc_status_channel_id")
+        msg_id = config.get("mc_status_message_id")
+
+        if not ch_id:
+            return await interaction.followup.send(
+                "❌ No hay ningún panel de estado configurado.", ephemeral=True
+            )
+
+        channel = interaction.guild.get_channel(ch_id)
+        if channel and msg_id:
+            try:
+                message = await channel.fetch_message(msg_id)
+                try:
+                    await message.unpin(reason="Panel de estado eliminado — /servidor panel-remove")
+                except Exception:
+                    pass
+                await message.delete()
+            except Exception:
+                pass
+
+        await db.set_guild_config(
+            interaction.guild_id, mc_status_channel_id=None, mc_status_message_id=None
+        )
+        await interaction.followup.send("✅ Panel de estado eliminado.", ephemeral=True)
+
+    @tasks.loop(minutes=MC_STATUS_REFRESH_MINUTES)
+    async def mcstatus_panel_loop(self):
+        """Refresca el embed del panel de estado en cada guild donde esté
+        configurado. Una sola consulta SLP se reutiliza para todos los
+        guilds — el servidor de Minecraft es el mismo para todos."""
+        any_panel_configured = False
+        for guild in self.bot.guilds:
+            try:
+                config = await db.get_guild_config(guild.id)
+                ch_id  = config.get("mc_status_channel_id")
+                msg_id = config.get("mc_status_message_id")
+                if not ch_id or not msg_id:
+                    continue
+                any_panel_configured = True
+                break
+            except Exception:
+                continue
+
+        if not any_panel_configured:
+            return
+
+        try:
+            data = await self._query_minecraft_server()
+            error = None
+        except Exception as e:
+            data, error = None, str(e)
+
+        embed = self._build_mcstatus_embed(data, error=error)
+
+        for guild in self.bot.guilds:
+            try:
+                config = await db.get_guild_config(guild.id)
+                ch_id  = config.get("mc_status_channel_id")
+                msg_id = config.get("mc_status_message_id")
+                if not ch_id or not msg_id:
+                    continue
+
+                channel = guild.get_channel(ch_id)
+                if not channel:
+                    continue
+
+                try:
+                    message = await channel.fetch_message(msg_id)
+                    await message.edit(embed=embed)
+                except discord.NotFound:
+                    # El mensaje fue borrado manualmente — limpiar config
+                    await db.set_guild_config(
+                        guild.id, mc_status_channel_id=None, mc_status_message_id=None
+                    )
+            except discord.Forbidden:
+                pass
+            except Exception as e:
+                logger.warning(
+                    "[UtilityCog] Error actualizando panel de estado en guild %s: %s",
+                    guild.id, e,
+                )
+
+    @mcstatus_panel_loop.before_loop
+    async def before_mcstatus_panel_loop(self):
+        await self.bot.wait_until_ready()
+
+    # ── /rank ─────────────────────────────────────────────────────────────────
+
+    rank_group = app_commands.Group(
+        name="rank",
+        description="Sistema de vinculación de cuenta de Minecraft",
+    )
+
+    @rank_group.command(
+        name="verificar",
+        description="Vincula tu nick de Minecraft con tu cuenta de Discord",
+    )
+    @app_commands.describe(nick="Tu nombre de usuario en Minecraft (exacto, case-insensitive)")
+    async def rank_verificar(self, interaction: discord.Interaction, nick: str):
+        await interaction.response.defer(ephemeral=True)
+
+        # Sanidad básica del nick (Minecraft: 3-16 chars, alfanumérico + _)
+        import re
+        if not re.fullmatch(r"[a-zA-Z0-9_]{3,16}", nick):
+            return await interaction.followup.send(
+                "❌ Nick inválido. Los nicks de Minecraft tienen entre 3 y 16 caracteres "
+                "y solo pueden contener letras, números y guiones bajos.",
+                ephemeral=True,
+            )
+
+        # Verificar con la API de Mojang que el nick existe
+        mojang_url = f"https://api.mojang.com/users/profiles/minecraft/{nick}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(mojang_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 204 or resp.status == 404:
+                        return await interaction.followup.send(
+                            f"❌ El nick `{nick}` no existe en Minecraft. "
+                            "Comprueba que esté escrito correctamente.",
+                            ephemeral=True,
+                        )
+                    if resp.status != 200:
+                        raise ValueError(f"HTTP {resp.status}")
+                    mojang_data = await resp.json()
+        except asyncio.TimeoutError:
+            return await interaction.followup.send(
+                "❌ La API de Mojang tardó demasiado. Inténtalo de nuevo.", ephemeral=True
+            )
+        except Exception as e:
+            return await interaction.followup.send(
+                f"❌ No se pudo verificar el nick con Mojang: `{e}`", ephemeral=True
+            )
+
+        mc_uuid = mojang_data.get("id")
+        mc_name = mojang_data.get("name", nick)  # nombre con capitalización correcta
+
+        # Comprobar si ese UUID ya está vinculado a otra cuenta de Discord
+        existing_by_uuid = await db.get_minecraft_link_by_uuid(mc_uuid)
+        if existing_by_uuid and existing_by_uuid["discord_id"] != interaction.user.id:
+            return await interaction.followup.send(
+                f"❌ El nick `{mc_name}` ya está vinculado a otra cuenta de Discord.",
+                ephemeral=True,
+            )
+
+        # Guardar/actualizar el vínculo de forma atómica (UUID UNIQUE en DB)
+        saved = await db.set_minecraft_link(interaction.user.id, mc_name, mc_uuid)
+        if not saved:
+            # Otro usuario terminó de vincularse al mismo UUID mientras este
+            # request estaba en vuelo — informar al usuario.
+            return await interaction.followup.send(
+                f"❌ El nick `{mc_name}` ya fue vinculado por otra cuenta de Discord "
+                "justo antes que tú. Si crees que hay un error, contacta con un administrador.",
+                ephemeral=True,
+            )
+
+        embed = discord.Embed(
+            title="✅ Cuenta vinculada",
+            description=(
+                f"Tu cuenta de Discord ha sido vinculada a **{mc_name}**.\n\n🪪 UUID: `{mc_uuid}`"
+            ),
+            color=discord.Color.green(),
+        )
+        embed.set_footer(text="MineOrbit Network • /rank verificar")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @rank_group.command(
+        name="info",
+        description="Consulta la vinculación de Minecraft de un usuario de Discord",
+    )
+    @app_commands.describe(usuario="Usuario de Discord a consultar (vacío = tú mismo)")
+    async def rank_info(self, interaction: discord.Interaction, usuario: discord.Member = None):
+        target = usuario or interaction.user
+        link = await db.get_minecraft_link(target.id)
+        if not link:
+            msg = (
+                "No tienes ninguna cuenta de Minecraft vinculada. Usa `/rank verificar`."
+                if target == interaction.user
+                else f"{target.mention} no tiene ninguna cuenta de Minecraft vinculada."
+            )
+            return await interaction.response.send_message(msg, ephemeral=True)
+
+        embed = discord.Embed(
+            title="🎮 Vinculación de Minecraft",
+            color=COLOR_INFO,
+        )
+        embed.add_field(name="Discord", value=target.mention, inline=True)
+        embed.add_field(name="Nick",    value=f"`{link['minecraft_nick']}`", inline=True)
+        embed.add_field(name="UUID",    value=f"`{link['minecraft_uuid']}`", inline=False)
+        embed.add_field(
+            name="Vinculado el",
+            value=link.get("linked_at", "—"),
+            inline=False,
+        )
+        embed.set_footer(text="MineOrbit Network • /rank info")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ── /backup ───────────────────────────────────────────────────────────────
+
+    backup_group = app_commands.Group(
+        name="backup",
+        description="Respaldo completo del servidor (roles y estructura de canales)",
+    )
+
+    @backup_group.command(
+        name="crear",
+        description="Exporta roles y estructura de canales/categorías del servidor como JSON",
+    )
+    @_backup_user_only()
+    async def backup_crear(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        roles_data = []
+        for role in sorted(interaction.guild.roles, key=lambda r: r.position, reverse=True):
+            roles_data.append({
+                "id":           role.id,
+                "name":         role.name,
+                "color":        str(role.color),
+                "color_value":  role.color.value,
+                "position":     role.position,
+                "permissions":  role.permissions.value,
+                "hoist":        role.hoist,
+                "mentionable":  role.mentionable,
+                "managed":      role.managed,
+            })
+
+        # -- Estructura de canales/categorias --------------------------------
+        # Se exporta por separado (categorias primero, luego el resto) para
+        # poder recrear el arbol en el mismo orden y volver a enlazar
+        # category_id al importar. Los overwrites de permisos se guardan
+        # referenciando el NOMBRE del rol (no su ID), porque al restaurar en
+        # otro servidor -o tras recrear roles- los IDs originales ya no
+        # existen; el nombre es lo unico estable entre backup e importacion.
+        def _overwrites_by_role_name(channel):
+            out = []
+            for target, overwrite in channel.overwrites.items():
+                if not isinstance(target, discord.Role):
+                    continue  # los overwrites por miembro no se respaldan (no son portables)
+                allow, deny = overwrite.pair()
+                out.append({
+                    "role_name": target.name,
+                    "allow": allow.value,
+                    "deny": deny.value,
+                })
+            return out
+
+        categories_data = []
+        for cat in sorted(interaction.guild.categories, key=lambda c: c.position):
+            categories_data.append({
+                "id":          cat.id,
+                "name":        cat.name,
+                "position":    cat.position,
+                "overwrites":  _overwrites_by_role_name(cat),
+            })
+
+        channels_data = []
+        for ch in sorted(
+            list(interaction.guild.text_channels) + list(interaction.guild.voice_channels),
+            key=lambda c: c.position,
+        ):
+            channels_data.append({
+                "id":          ch.id,
+                "name":        ch.name,
+                "type":        "voice" if isinstance(ch, discord.VoiceChannel) else "text",
+                "position":    ch.position,
+                "category_id": ch.category_id,
+                "topic":       getattr(ch, "topic", None),
+                "nsfw":        getattr(ch, "nsfw", False),
+                "slowmode_delay": getattr(ch, "slowmode_delay", 0),
+                "overwrites":  _overwrites_by_role_name(ch),
+            })
+
+        timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename  = f"server_backup_{interaction.guild.id}_{timestamp}.json"
+        payload   = json.dumps({"guild_id": interaction.guild.id,
+                                "guild_name": interaction.guild.name,
+                                "exported_at": timestamp,
+                                "roles": roles_data,
+                                "categories": categories_data,
+                                "channels": channels_data},
+                               indent=2, ensure_ascii=False)
+
+        file_obj = discord.File(
+            fp=io.BytesIO(payload.encode("utf-8")),
+            filename=filename,
+        )
+
+        embed = discord.Embed(
+            title="✅ Backup del servidor generado",
+            description=(
+                f"**{len(roles_data)}** roles, **{len(categories_data)}** categorias "
+                f"y **{len(channels_data)}** canales exportados.\n"
+                "El archivo JSON incluye roles (nombre, color, permisos), "
+                "la estructura de categorias/canales y sus overwrites de permisos "
+                "(enlazados por nombre de rol).\n\n"
+                "Guardalo en un lugar seguro -- con `/backup importar` puedes "
+                "restaurar roles y canales faltantes a partir de este archivo."
+            ),
+            color=COLOR_SUCCESS,
+        )
+        embed.set_footer(text=f"MineOrbit Network • {filename}")
+        await interaction.followup.send(embed=embed, file=file_obj, ephemeral=True)
+
+
+    @backup_group.command(
+        name="db",
+        description="Envía una copia comprimida de la base de datos (.db) del bot",
+    )
+    @_backup_user_only()
+    async def backup_db(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            data, filename = await asyncio.to_thread(_build_db_backup_zip, db.DB_PATH)
+        except Exception as e:
+            logger.exception("Error generando backup de la BD")
+            return await interaction.followup.send(
+                f"❌ No se pudo generar el backup de la base de datos: `{e}`", ephemeral=True
+            )
+
+        limit = getattr(interaction, "filesize_limit", 10 * 1024 * 1024)
+        size_mb = len(data) / (1024 * 1024)
+        if len(data) > limit:
+            return await interaction.followup.send(
+                f"❌ El backup comprimido pesa **{size_mb:.1f} MB** y supera el límite de "
+                f"subida de Discord (**{limit / (1024 * 1024):.0f} MB**). "
+                "Descarga `discord_bot.db` directamente desde donde está alojado el bot.",
+                ephemeral=True,
+            )
+
+        embed = discord.Embed(
+            title="💾 Backup de la base de datos",
+            description=(
+                f"Copia consistente de `discord_bot.db` comprimida (**{size_mb:.2f} MB**).\n"
+                "Contiene datos sensibles (usuarios, tickets, vínculos de Minecraft, "
+                "códigos de la tienda…): guárdala en un lugar privado.\n\n"
+                f"Próximo recordatorio en **{BACKUP_REMINDER_DAYS} días**."
+            ),
+            color=COLOR_SUCCESS,
+        )
+        embed.set_footer(text=f"MineOrbit Network • {filename}")
+        await interaction.followup.send(
+            embed=embed,
+            file=discord.File(io.BytesIO(data), filename=filename),
+            ephemeral=True,
+        )
+        # Backup hecho → el contador de 7 días vuelve a empezar.
+        await self._set_last_reminder(datetime.datetime.utcnow())
+
+    # ── Recordatorio semanal de backup ───────────────────────────────────────
+
+    async def _get_last_reminder(self):
+        row = await db.fetchone("SELECT last_sent FROM backup_reminder WHERE id=1")
+        if not row or not row.get("last_sent"):
+            return None
+        try:
+            return datetime.datetime.fromisoformat(row["last_sent"])
+        except ValueError:
+            return None
+
+    async def _set_last_reminder(self, when: datetime.datetime) -> None:
+        await db.execute(
+            "INSERT OR REPLACE INTO backup_reminder (id, last_sent) VALUES (1, ?)",
+            (when.isoformat(),),
+        )
+
+    @tasks.loop(hours=1)
+    async def backup_reminder_loop(self):
+        """Cada hora comprueba si pasaron BACKUP_REMINDER_DAYS días desde el
+        último recordatorio/backup y, si es así, avisa por DM al responsable."""
+        try:
+            now = datetime.datetime.utcnow()
+            last = await self._get_last_reminder()
+            if last is None:
+                # Primera ejecución: el primer recordatorio llegará en 7 días.
+                await self._set_last_reminder(now)
+                return
+            if now - last < datetime.timedelta(days=BACKUP_REMINDER_DAYS):
+                return
+
+            user = self.bot.get_user(BACKUP_USER_ID) or await self.bot.fetch_user(BACKUP_USER_ID)
+            embed = discord.Embed(
+                title="💾 Recordatorio: hora de hacer el backup",
+                description=(
+                    f"Han pasado **{BACKUP_REMINDER_DAYS} días** desde el último backup.\n\n"
+                    "En MineOrbit Network ejecuta:\n"
+                    "• `/backup db` — base de datos del bot (.zip)\n"
+                    "• `/backup crear` — roles y estructura de canales (.json)\n\n"
+                    "Guarda los archivos en un lugar seguro."
+                ),
+                color=COLOR_INFO,
+            )
+            embed.timestamp = now
+            try:
+                await user.send(embed=embed)
+            except (discord.Forbidden, discord.HTTPException) as e:
+                # No se actualiza last_sent → se reintenta en la próxima hora.
+                logger.warning("No se pudo enviar el recordatorio de backup por DM: %s", e)
+                return
+            await self._set_last_reminder(now)
+        except Exception:
+            logger.exception("Error en backup_reminder_loop")
+
+    @backup_reminder_loop.before_loop
+    async def before_backup_reminder_loop(self):
+        await self.bot.wait_until_ready()
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS backup_reminder "
+            "(id INTEGER PRIMARY KEY CHECK (id = 1), last_sent TEXT)"
+        )
+
+    @backup_group.command(
+        name="importar",
+        description="Importa roles y canales/categorias desde un archivo JSON generado por /backup crear",
+    )
+    @app_commands.describe(archivo="Archivo JSON exportado con /backup crear")
+    @_backup_user_only()
+    async def backup_importar(
+        self,
+        interaction: discord.Interaction,
+        archivo: discord.Attachment,
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        # ── Validaciones del archivo ──────────────────────────────────────────
+        if not archivo.filename.endswith(".json"):
+            return await interaction.followup.send(
+                "❌ El archivo debe ser un `.json` generado por `/backup crear`.",
+                ephemeral=True,
+            )
+        if archivo.size > 1_024_000:  # 1 MB — suficiente para servidores grandes con muchos canales
+            return await interaction.followup.send(
+                "❌ El archivo es demasiado grande (máx. 1 MB).", ephemeral=True
+            )
+
+        # ── Descargar y parsear ───────────────────────────────────────────────
+        try:
+            raw = await archivo.read()
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            return await interaction.followup.send(
+                f"❌ No se pudo leer el archivo: `{e}`", ephemeral=True
+            )
+
+        if not isinstance(data, dict):
+            return await interaction.followup.send(
+                "❌ Formato incorrecto. Se esperaba un objeto JSON generado por `/backup crear`.",
+                ephemeral=True,
+            )
+
+        roles_list = data.get("roles") or []
+        categories_list = data.get("categories") or []
+        channels_list = data.get("channels") or []
+
+        def _fmt(lst: list[str], limit: int = 20) -> str:
+            if not lst:
+                return "—"
+            shown = lst[:limit]
+            extra = len(lst) - limit
+            text  = ", ".join(shown)
+            return text + (f" y {extra} más…" if extra > 0 else "")
+
+        # ── 1) Procesar roles (igual que antes) ────────────────────────────────
+        existing_roles: dict[str, discord.Role] = {
+            r.name.lower(): r for r in interaction.guild.roles
+        }
+
+        roles_creados     : list[str] = []
+        roles_actualizados : list[str] = []
+        roles_omitidos     : list[str] = []
+        roles_errores      : list[str] = []
+
+        roles_sorted = sorted(roles_list, key=lambda r: r.get("position", 0))
+
+        for entry in roles_sorted:
+            nombre = entry.get("name", "").strip()
+
+            if not nombre or nombre == "@everyone":
+                continue
+            if entry.get("managed"):
+                roles_omitidos.append(f"`{nombre}` (gestionado por integración)")
+                continue
+
+            color_value = entry.get("color_value") or 0
+            perms_value = entry.get("permissions") or 0
+            hoist       = bool(entry.get("hoist", False))
+            mentionable = bool(entry.get("mentionable", False))
+
+            color = discord.Color(color_value)
+            perms = discord.Permissions(perms_value)
+
+            existing_role = existing_roles.get(nombre.lower())
+
+            if existing_role:
+                try:
+                    await existing_role.edit(
+                        color=color,
+                        permissions=perms,
+                        hoist=hoist,
+                        mentionable=mentionable,
+                        reason=f"Importación de backup por {interaction.user}",
+                    )
+                    roles_actualizados.append(f"`{nombre}`")
+                except discord.Forbidden:
+                    roles_errores.append(f"`{nombre}` (sin permisos para editar)")
+                except Exception as e:
+                    roles_errores.append(f"`{nombre}` ({e})")
+            else:
+                try:
+                    nuevo = await interaction.guild.create_role(
+                        name=nombre,
+                        color=color,
+                        permissions=perms,
+                        hoist=hoist,
+                        mentionable=mentionable,
+                        reason=f"Importación de backup por {interaction.user}",
+                    )
+                    existing_roles[nombre.lower()] = nuevo
+                    roles_creados.append(f"`{nombre}`")
+                except discord.Forbidden:
+                    roles_errores.append(f"`{nombre}` (sin permisos para crear)")
+                except Exception as e:
+                    roles_errores.append(f"`{nombre}` ({e})")
+
+        # ── 2) Procesar categorías ──────────────────────────────────────────────
+        # Solo se CREAN categorías/canales faltantes (por nombre) — nunca se
+        # borran ni se renombran los existentes, para que importar un backup
+        # nunca sea destructivo por accidente.
+        def _build_overwrites(entry_overwrites: list[dict]) -> dict:
+            overwrites = {}
+            for ow in entry_overwrites or []:
+                role = existing_roles.get(ow.get("role_name", "").lower())
+                if not role:
+                    continue
+                overwrites[role] = discord.PermissionOverwrite.from_pair(
+                    discord.Permissions(ow.get("allow", 0)),
+                    discord.Permissions(ow.get("deny", 0)),
+                )
+            return overwrites
+
+        existing_categories: dict[str, discord.CategoryChannel] = {
+            c.name.lower(): c for c in interaction.guild.categories
+        }
+
+        cat_creadas  : list[str] = []
+        cat_errores  : list[str] = []
+        # Mapa id_original_en_json -> objeto de categoría real en el guild,
+        # para poder enlazar los canales a su categoría correcta más abajo.
+        category_id_map: dict[int, discord.CategoryChannel] = {}
+
+        for entry in sorted(categories_list, key=lambda x: x.get("position", 0)):
+            nombre = entry.get("name", "").strip()
+            if not nombre:
+                continue
+            cat_obj = existing_categories.get(nombre.lower())
+            if not cat_obj:
+                try:
+                    cat_obj = await interaction.guild.create_category(
+                        name=nombre,
+                        overwrites=_build_overwrites(entry.get("overwrites")),
+                        reason=f"Importación de backup por {interaction.user}",
+                    )
+                    existing_categories[nombre.lower()] = cat_obj
+                    cat_creadas.append(f"`{nombre}`")
+                except discord.Forbidden:
+                    cat_errores.append(f"`{nombre}` (sin permisos para crear)")
+                except Exception as e:
+                    cat_errores.append(f"`{nombre}` ({e})")
+                    continue
+            if entry.get("id") is not None:
+                category_id_map[entry["id"]] = cat_obj
+
+        # ── 3) Procesar canales de texto/voz ─────────────────────────────────
+        existing_channels: dict[tuple[str, str], discord.abc.GuildChannel] = {}
+        for ch in interaction.guild.text_channels:
+            existing_channels[(ch.name.lower(), "text")] = ch
+        for ch in interaction.guild.voice_channels:
+            existing_channels[(ch.name.lower(), "voice")] = ch
+
+        ch_creados : list[str] = []
+        ch_errores : list[str] = []
+
+        for entry in sorted(channels_list, key=lambda x: x.get("position", 0)):
+            nombre = entry.get("name", "").strip()
+            tipo   = entry.get("type", "text")
+            if not nombre:
+                continue
+            if (nombre.lower(), tipo) in existing_channels:
+                continue  # ya existe un canal con ese nombre y tipo — no tocarlo
+
+            category_obj = category_id_map.get(entry.get("category_id"))
+            overwrites = _build_overwrites(entry.get("overwrites"))
+
+            try:
+                if tipo == "voice":
+                    nuevo = await interaction.guild.create_voice_channel(
+                        name=nombre,
+                        category=category_obj,
+                        overwrites=overwrites,
+                        reason=f"Importación de backup por {interaction.user}",
+                    )
+                else:
+                    nuevo = await interaction.guild.create_text_channel(
+                        name=nombre,
+                        category=category_obj,
+                        topic=entry.get("topic"),
+                        nsfw=bool(entry.get("nsfw", False)),
+                        slowmode_delay=int(entry.get("slowmode_delay") or 0),
+                        overwrites=overwrites,
+                        reason=f"Importación de backup por {interaction.user}",
+                    )
+                existing_channels[(nombre.lower(), tipo)] = nuevo
+                ch_creados.append(f"`{nombre}`")
+            except discord.Forbidden:
+                ch_errores.append(f"`{nombre}` (sin permisos para crear)")
+            except Exception as e:
+                ch_errores.append(f"`{nombre}` ({e})")
+
+        # ── Resumen ───────────────────────────────────────────────────────────
+        total_errores = roles_errores + cat_errores + ch_errores
+        embed = discord.Embed(
+            title="📥 Importación de backup completada",
+            description=(
+                "Los roles y canales existentes se actualizaron o se dejaron intactos; "
+                "solo se crean roles/categorías/canales que faltaban por nombre. "
+                "Ningún canal ni rol existente fue eliminado."
+            ),
+            color=COLOR_SUCCESS if not total_errores else discord.Color.orange(),
+        )
+        embed.add_field(
+            name=f"✅ Roles creados ({len(roles_creados)})", value=_fmt(roles_creados), inline=False
+        )
+        embed.add_field(
+            name=f"🔄 Roles actualizados ({len(roles_actualizados)})",
+            value=_fmt(roles_actualizados),
+            inline=False,
+        )
+        if roles_omitidos:
+            embed.add_field(
+                name=f"⏭️ Roles omitidos ({len(roles_omitidos)})",
+                value=_fmt(roles_omitidos),
+                inline=False,
+            )
+        embed.add_field(
+            name=f"📁 Categorías creadas ({len(cat_creadas)})", value=_fmt(cat_creadas), inline=False
+        )
+        embed.add_field(
+            name=f"📺 Canales creados ({len(ch_creados)})", value=_fmt(ch_creados), inline=False
+        )
+        if total_errores:
+            embed.add_field(
+                name=f"❌ Errores ({len(total_errores)})",
+                value=_fmt(total_errores),
+                inline=False,
+            )
+        embed.set_footer(
+            text=f"Archivo: {archivo.filename} • MineOrbit Network"
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    # ── /mantenimiento ────────────────────────────────────────────────────────
+
+    mant_group = app_commands.Group(
+        name="mantenimiento",
+        description="Modo mantenimiento — restringe el servidor excepto un canal de avisos",
+    )
+
+    @mant_group.command(
+        name="activar",
+        description="Activa el modo mantenimiento (bloquea todos los canales de texto excepto uno)",
+    )
+    @app_commands.describe(
+        canal="Canal que quedará accesible durante el mantenimiento (p.ej. #avisos)"
+    )
+    @checks.is_owner()
+    async def mantenimiento_activar(
+        self,
+        interaction: discord.Interaction,
+        canal: discord.TextChannel,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        config = await db.get_guild_config(interaction.guild_id)
+        if config.get("maintenance_active"):
+            return await interaction.followup.send(
+                "⚠️ El modo mantenimiento ya está activo. "
+                "Usa `/mantenimiento desactivar` primero.",
+                ephemeral=True,
+            )
+
+        # overrides: dict[str(channel_id) -> original send_messages tri-state]
+        # None  = no había override → al desactivar se elimina el override completo
+        # True  = había override explícito allow → se restaura
+        # False = ya estaba bloqueado antes del mantenimiento → no se toca
+        overrides: dict[str, bool | None] = {}
+        failed_channels: list[str] = []
+
+        for ch in interaction.guild.channels:
+            if not isinstance(ch, (discord.TextChannel, discord.ForumChannel,
+                                   discord.StageChannel)):
+                continue
+            if ch.id == canal.id:
+                continue
+
+            # Leer el override actual de @everyone para send_messages
+            ow = ch.overwrites_for(interaction.guild.default_role)
+            if ow.send_messages is False:
+                # Ya estaba bloqueado antes del mantenimiento — registrar pero no tocar
+                overrides[str(ch.id)] = False
+                continue
+
+            # Guardar el estado original (None = sin override, True = permitido explícito)
+            original = ow.send_messages  # None o True
+            try:
+                ow.send_messages = False
+                await ch.set_permissions(
+                    interaction.guild.default_role,
+                    overwrite=ow,
+                    reason="Modo mantenimiento activado",
+                )
+                overrides[str(ch.id)] = original
+            except discord.Forbidden:
+                failed_channels.append(ch.name)
+            except Exception:
+                failed_channels.append(ch.name)
+
+        locked_count = sum(1 for v in overrides.values() if v is not False)
+
+        await db.set_guild_config(
+            interaction.guild_id,
+            maintenance_active=1,
+            maintenance_channel=canal.id,
+            maintenance_overrides=json.dumps(overrides),
+        )
+
+        # Aviso en el canal seguro
+        maint_embed = discord.Embed(
+            title="🔧 Modo Mantenimiento Activo",
+            description=(
+                "El servidor está en **mantenimiento**. Los canales están "
+                "temporalmente desactivados.\n\n"
+                "Estaremos de vuelta pronto. ¡Gracias por tu paciencia! 🌀"
+            ),
+            color=discord.Color.orange(),
+        )
+        try:
+            await canal.send(embed=maint_embed)
+        except Exception:
+            pass
+
+        resumen = (
+            f"✅ Modo mantenimiento activado.\n"
+            f"• **{locked_count}** canales bloqueados.\n"
+            f"• Canal seguro: {canal.mention}."
+        )
+        if failed_channels:
+            resumen += f"\n⚠️ Sin permisos en: {', '.join(failed_channels[:5])}"
+        await interaction.followup.send(resumen, ephemeral=True)
+
+    @mant_group.command(
+        name="desactivar",
+        description="Desactiva el modo mantenimiento y restaura los canales",
+    )
+    @checks.is_owner()
+    async def mantenimiento_desactivar(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        config = await db.get_guild_config(interaction.guild_id)
+        if not config.get("maintenance_active"):
+            return await interaction.followup.send(
+                "⚠️ El modo mantenimiento no está activo.", ephemeral=True
+            )
+
+        # overrides: dict[str(channel_id) -> original send_messages]
+        # False = ya estaba bloqueado antes → no restaurar
+        # None  = no había override → eliminar override al restaurar
+        # True  = había override allow → restaurar a True
+        overrides: dict[str, bool | None] = json.loads(
+            config.get("maintenance_overrides") or "{}"
+        )
+        safe_channel_id = config.get("maintenance_channel")
+
+        restored  = 0
+        failed_ch : list[str] = []
+
+        for ch_id_str, original in overrides.items():
+            if original is False:
+                # Este canal ya estaba bloqueado antes del mantenimiento — no tocarlo
+                continue
+            ch = interaction.guild.get_channel(int(ch_id_str))
+            if not ch:
+                continue
+            try:
+                ow = ch.overwrites_for(interaction.guild.default_role)
+                ow.send_messages = original  # None (sin override) o True (allow explícito)
+                if ow.is_empty():
+                    await ch.set_permissions(
+                        interaction.guild.default_role,
+                        overwrite=None,
+                        reason="Modo mantenimiento desactivado",
+                    )
+                else:
+                    await ch.set_permissions(
+                        interaction.guild.default_role,
+                        overwrite=ow,
+                        reason="Modo mantenimiento desactivado",
+                    )
+                restored += 1
+            except discord.Forbidden:
+                failed_ch.append(ch.name)
+            except Exception:
+                failed_ch.append(ch.name)
+
+        await db.set_guild_config(
+            interaction.guild_id,
+            maintenance_active=0,
+            maintenance_channel=None,
+            maintenance_overrides=None,
+        )
+
+        # Aviso en el canal seguro
+        if safe_channel_id:
+            safe_ch = interaction.guild.get_channel(safe_channel_id)
+            if safe_ch:
+                end_embed = discord.Embed(
+                    title="✅ Mantenimiento Finalizado",
+                    description=(
+                        "El mantenimiento ha concluido. "
+                        "¡Todos los canales están de nuevo disponibles! 🎉"
+                    ),
+                    color=discord.Color.green(),
+                )
+                try:
+                    await safe_ch.send(embed=end_embed)
+                except Exception:
+                    pass
+
+        resumen = (
+            f"✅ Modo mantenimiento desactivado.\n"
+            f"• **{restored}** canales restaurados."
+        )
+        if failed_ch:
+            resumen += f"\n⚠️ Sin permisos para restaurar: {', '.join(failed_ch[:5])}"
+        await interaction.followup.send(resumen, ephemeral=True)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(UtilityCog(bot))
